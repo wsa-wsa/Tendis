@@ -5,12 +5,18 @@
 #ifndef SRC_TENDISPLUS_SERVER_SERVER_ENTRY_H_
 #define SRC_TENDISPLUS_SERVER_SERVER_ENTRY_H_
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <iostream>
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -21,6 +27,7 @@
 #include "tendisplus/cluster/cluster_manager.h"
 #include "tendisplus/cluster/gc_manager.h"
 #include "tendisplus/cluster/migrate_manager.h"
+#include "tendisplus/commands/command.h"
 #include "tendisplus/lock/mgl/mgl_mgr.h"
 #include "tendisplus/network/network.h"
 #include "tendisplus/network/worker_pool.h"
@@ -41,6 +48,96 @@
 #define SLOWLOG_ENTRY_MAX_STRING 128;
 
 namespace tendisplus {
+template <typename T>
+class LinkedSet {
+private:
+    std::list<T> orderList;
+    std::unordered_map<T, typename std::list<T>::iterator> indexMap;
+public:
+    // ==== 基础功能 ==== 
+    // 检查元素是否存在
+    bool contains(const T& value) const {
+        return indexMap.find(value) != indexMap.end();
+    }
+    
+    // 获取元素数量
+    size_t size() const {
+        return indexMap.size(); 
+    }
+    
+    // 检查是否为空
+    bool empty() const {
+        return indexMap.empty(); 
+    }
+
+    // ==== 插入操作 ==== 
+    // 尾部插入（基本插入方式）
+    void push_back(const T& value) {
+        // 如果元素已存在，先移除旧位置
+        if (contains(value)) {
+            orderList.erase(indexMap[value]);
+            indexMap.erase(value);
+        }
+        
+        orderList.push_back(value);
+        indexMap[value] = std::prev(orderList.end());
+    }
+    
+    // 头部插入（适合高优先级任务或重试）
+    void push_front(const T& value) {
+        // 如果元素已存在，先移除旧位置
+        if (contains(value)) {
+            orderList.erase(indexMap[value]);
+            indexMap.erase(value);
+        }
+        
+        orderList.push_front(value);
+        indexMap[value] = orderList.begin();
+    }
+
+    // ==== 删除操作 ==== 
+    // 从头部删除并返回元素 - 类似队列的dequeue
+    T pop_front() {
+        if (orderList.empty()) {
+            throw std::out_of_range("LinkedSet is empty");
+        }
+        
+        T value = orderList.front();
+        orderList.pop_front();
+        indexMap.erase(value);
+        return value;
+    }
+    
+    // 从任意位置删除元素
+    void erase(const T& value) {
+        auto it = indexMap.find(value);
+        if (it != indexMap.end()) {
+            orderList.erase(it->second);
+            indexMap.erase(it);
+        }
+    }
+
+    // ==== 访问操作 ==== 
+    // 获取头部元素（不删除）
+    const T& front() const {
+        if (orderList.empty()) {
+            throw std::out_of_range("LinkedSet is empty");
+        }
+        return orderList.front();
+    }
+    
+    // 获取尾部元素（不删除）
+    const T& back() const {
+        if (orderList.empty()) {
+            throw std::out_of_range("LinkedSet is empty");
+        }
+        return orderList.back();
+    }
+
+    // ==== 迭代器 ====
+    auto begin() const { return orderList.begin(); }
+    auto end() const { return orderList.end(); }
+};
 class Session;
 class NetworkAsio;
 class NetworkMatrix;
@@ -188,6 +285,21 @@ class ServerEntry : public std::enable_shared_from_this<ServerEntry> {
         _executorList.size();
     }
     _executorList[ctxId]->schedule(std::forward<fn>(task));
+  }
+  template <typename fn>
+  std::pair<uint32_t, uint64_t> schedule_at(fn&& task, uint32_t ctxId, uint64_t timeout) {
+    std::chrono::microseconds us(timeout);
+    std::shared_lock<std::shared_timed_mutex> lock(_exeThreadMutex);
+    if (ctxId == UINT32_MAX || ctxId >= _executorList.size()) {
+      ctxId = _scheduleNum.fetch_add(1, std::memory_order_relaxed) %
+        _executorList.size();
+    }
+    auto timerId = _executorList[ctxId]->timer_add(std::forward<fn>(task), us);
+    return {ctxId, timerId};
+  }
+  void cancelTimer(uint32_t ctxId, uint64_t timerId) {
+    std::shared_lock<std::shared_timed_mutex> lock(_exeThreadMutex);
+    _executorList[ctxId]->timer_cancel(timerId);
   }
   uint32_t getExeThreadNum() const {
     std::shared_lock<std::shared_timed_mutex> lock(_exeThreadMutex);
@@ -420,6 +532,89 @@ class ServerEntry : public std::enable_shared_from_this<ServerEntry> {
   void CloseChannelBySlot(SlotsBitmap slots);
   void CloseAllChannel();
 
+  void blockOnKeys(Session* sess, const std::vector<std::string>& keys){
+    std::lock_guard<std::mutex> lk(_mutex_block_keys);
+    for(auto& key : keys){
+        _block_keys[key].push_back(sess);
+    }
+  }
+
+  void unblockOnKeys(Session* sess, const std::vector<std::string>& keys){
+    std::lock_guard<std::mutex> lk(_mutex_block_keys);
+    for(auto& key : keys){
+        auto& sessList = _block_keys[key];
+        sessList.erase(sess);
+        if (sessList.empty()) {
+            _block_keys.erase(key);
+        }
+    }
+  }
+
+  void reblockOnKey(const std::string& key, const std::vector<Session*>& sessList){
+    std::lock_guard<std::mutex> lk(_mutex_block_keys);
+    for(auto& sess : sessList){
+        _block_keys[key].push_front(sess);
+    }
+  }
+   uint64_t blockOnKeys_(Session* sess, const std::vector<std::string>& keys){
+    _block_cmd_id.fetch_add(1);
+    std::lock_guard<std::mutex> lk(_mutex_block_keys);
+    for(auto& key : keys){
+        _block_sessions[key].insert({_block_cmd_id, sess->id()});
+    }
+    return _block_cmd_id;
+  }
+
+  void unblockOnKeys_(Session* sess, const std::vector<std::string>& keys, uint64_t block_cmd_id){
+    std::lock_guard<std::mutex> lk(_mutex_block_keys);
+    for(auto& key : keys){
+        auto& sessList = _block_sessions[key];
+        auto iter = sessList.find(block_cmd_id);
+        if (iter != sessList.end()) {
+            sessList.erase(iter);
+        }
+        if (sessList.empty()) {
+            _block_sessions.erase(key);
+        }
+    }
+  }
+
+  void reblockOnKey_(const std::string& key, uint64_t block_cmd_id, uint64_t sessId){
+    std::lock_guard<std::mutex> lk(_mutex_block_keys);
+    getSession(sessId);
+    _block_sessions[key].insert({block_cmd_id, sessId});
+  }
+
+  void wakeUpByKey(const std::string& key, size_t n_client){
+    std::lock_guard<std::mutex> lk(_mutex_block_keys);
+    auto iter = _block_keys.find(key);
+    if(iter == _block_keys.end()||iter->second.empty()){
+        return;
+    }
+    auto &blokedList = iter->second;
+    std::cout<<"key:"<<key<<",n_client:"<<n_client<<std::endl;
+    std::vector<Session*> toProcess;
+    while(n_client--&& !blokedList.empty()){
+        auto sess = blokedList.pop_front();
+        toProcess.push_back(sess);
+    }
+    auto executor = [this, key, toProcess]()mutable{
+        while(!toProcess.empty()){
+            auto sess = toProcess.front();
+            toProcess.erase(toProcess.begin());
+            auto vv = dynamic_cast<NetSession*>(sess);
+            if (vv != nullptr) {
+                auto status = vv->continueCmd();
+                if (!status.ok()) {
+                    break;
+                }
+            }
+        }
+        reblockOnKey(key, toProcess);
+    };
+    uint32_t ctxId = UINT32_MAX;
+    schedule(std::move(executor), ctxId);
+  }
  private:
   ServerEntry();
   Status adaptSomeThreadNumByCpuNum(const std::shared_ptr<ServerParams>& cfg);
@@ -521,6 +716,11 @@ class ServerEntry : public std::enable_shared_from_this<ServerEntry> {
   SlowlogStat _slowlogStat;
   LatencyMonitorSet _latencyMonitorSet;
   uint32_t _lastJeprofDumpMemoryGB;
+
+  std::unordered_map<std::string, std::map<uint64_t, uint64_t>> _block_sessions;
+  std::atomic<uint64_t> _block_cmd_id;
+  std::unordered_map<std::string, LinkedSet<Session*>> _block_keys; //可以使用session id来解决某些问题
+  mutable std::mutex _mutex_block_keys;
 };
 }  // namespace tendisplus
 

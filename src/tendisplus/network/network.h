@@ -8,14 +8,17 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdint>
 #include <list>
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "asio.hpp"  // NOLINT(build/include_subdir)
+#include "asio/io_context.hpp"
 #include "gtest/gtest.h"
 
 #include "tendisplus/network/blocking_tcp_client.h"
@@ -190,6 +193,26 @@ class NetSession : public Session {
 
   const std::vector<std::string>& getArgs() const;
   void setArgs(const std::vector<std::string>&);
+ 
+  std::atomic<bool> _isBlocked{false};
+  std::vector<std::string> _blockedKeys;
+  std::pair<uint32_t, uint64_t> _timerId;
+  std::function<Expected<std::string>()> _blocking_completion_cb;
+
+  void processAfterReq();
+  void setTimerId(std::pair<uint32_t, uint64_t> id) {
+    _timerId = std::move(id);
+  }
+  void blockOnKeys(const std::vector<std::string>& keys);
+  void addBlockTimer(uint64_t timeout);
+  void cancelTimer();
+
+  void clearBlockStatus();
+
+  void setBlockingCompletionCb(std::function<Expected<std::string>()> cb) {
+    _blocking_completion_cb = std::move(cb);
+  }
+  Expected<std::string> continueCmd();
 
   enum class State {
     Created,

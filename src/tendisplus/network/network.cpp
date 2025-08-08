@@ -5,6 +5,7 @@
 #include "tendisplus/network/network.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
 #include <memory>
@@ -12,11 +13,13 @@
 #include <utility>
 #include <vector>
 
+#include "tendisplus/commands/command.h"
 #include "tendisplus/server/server_entry.h"
 #include "tendisplus/storage/varint.h"
 #include "tendisplus/utils/invariant.h"
 #include "tendisplus/utils/redis_port.h"
 #include "tendisplus/utils/scopeguard.h"
+#include "tendisplus/utils/status.h"
 #include "tendisplus/utils/sync_point.h"
 #include "tendisplus/utils/test_util.h"
 
@@ -561,6 +564,80 @@ void NetSession::schedule() {
   auto self(shared_from_this());
   _server->schedule([this, self]() { stepState(); }, _ioCtxId);
 }
+
+void NetSession::processAfterReq(){
+    if (_closeAfterRsp){
+        // closeAfterRsp, donot process more requests
+        // let drainRspCallback end this session
+        setState(State::Stop);
+        return;
+    }
+    if (_isBlocked.load(std::memory_order_relaxed)){
+        return;
+    }
+    resetMultiBulkCtx();
+    if (_queryBufPos == 0) {
+        setState(State::DrainReqNet);
+        return;
+    } else {
+        setState(State::DrainReqBuf);
+        ++_netMatrix->stickyPackets;
+        return;
+    }
+}
+
+void NetSession::blockOnKeys(const std::vector<std::string>& keys) {
+    _isBlocked.store(true, std::memory_order_relaxed);
+    _server->blockOnKeys(this, keys);
+    _blockedKeys = keys;
+}
+// TODO: 是否要使用shared_ptr???
+void NetSession::addBlockTimer(uint64_t timeout){
+    if (!timeout)return;
+    _timerId = _server->schedule_at([this]() {     
+        if (!_isBlocked.load(std::memory_order_relaxed)) {
+            return;
+        }
+        _isBlocked.store(false, std::memory_order_relaxed);
+        _server->unblockOnKeys(this, _blockedKeys);
+        clearBlockStatus();
+        setResponse(Command::fmtNull());
+        drainRsp();
+    }, _ioCtxId, timeout);
+}
+
+void NetSession::cancelTimer() {
+  if (_timerId.first == UINT32_MAX) {
+    return;
+  }
+  _server->cancelTimer(_timerId.first, _timerId.second);
+  _timerId = {UINT32_MAX, 0};
+}
+
+void NetSession::clearBlockStatus() {
+  _server->unblockOnKeys(this, _blockedKeys);
+  _blockedKeys.clear();
+  cancelTimer();
+}
+
+Expected<std::string> NetSession::continueCmd() {
+    if (!_isBlocked.load(std::memory_order_relaxed)){
+        return {ErrorCodes::ERR_OK, ""};
+    }
+    _isBlocked.store(false, std::memory_order_relaxed);
+    auto status = _blocking_completion_cb();
+    if(!status.ok()){
+        _isBlocked.store(true, std::memory_order_relaxed);
+        return status;
+    }
+    setResponse(std::move(status.value()));
+    // processAfterReq();
+    // resetMultiBulkCtx();
+    drainRsp();
+    clearBlockStatus();
+    return status;
+}
+
 
 asio::ip::tcp::socket NetSession::borrowConn() {
   return std::move(_sock);

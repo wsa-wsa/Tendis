@@ -5,14 +5,20 @@
 #include <algorithm>
 #include <cctype>
 #include <clocale>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+#include "asio/post.hpp"
+#include "asio/steady_timer.hpp"
 
 #include "tendisplus/commands/command.h"
+#include "tendisplus/network/network.h"
 #include "tendisplus/utils/invariant.h"
 #include "tendisplus/utils/scopeguard.h"
+#include "tendisplus/utils/status.h"
 #include "tendisplus/utils/string.h"
 #include "tendisplus/utils/sync_point.h"
 
@@ -295,6 +301,170 @@ class RPopCommand : public ListPopWrapper {
   RPopCommand() : ListPopWrapper(ListPos::LP_TAIL, "wF") {}
 } rpopCommand;
 
+class BlockPopWrapper : public Command {
+ public:
+  explicit BlockPopWrapper(ListPos pos, const char* sflags)
+    : Command(pos == ListPos::LP_HEAD ? "blpop" : "brpop", sflags), _pos(pos) {}
+
+  ssize_t arity() const {
+    return -2;
+  }
+
+  int32_t firstkey() const {
+    return 1;
+  }
+
+  int32_t lastkey() const {
+    return 1;
+  }
+
+  int32_t keystep() const {
+    return 1;
+  }
+
+  Expected<std::string> tryPop(Session* sess, const std::string& key) {
+    SessionCtx* pCtx = sess->getCtx();
+    INVARIANT(pCtx != nullptr);
+
+    auto server = sess->getServerEntry();
+    auto expdb = server->getSegmentMgr()->getDbWithKeyLock(
+      sess, key, mgl::LockMode::LOCK_X);
+    if (!expdb.ok()) {
+      return expdb.status();
+    }
+    Expected<RecordValue> rv =
+      Command::expireKeyIfNeeded(sess, key, RecordType::RT_LIST_META);
+    if (rv.status().code() == ErrorCodes::ERR_EXPIRED ||
+        rv.status().code() == ErrorCodes::ERR_NOTFOUND) {
+      return Command::fmtNull();
+    } else if (!rv.ok()) {
+      return rv.status();
+    }
+
+    // record exists
+    RecordKey metaRk(expdb.value().chunkId,
+                     pCtx->getDbId(),
+                     RecordType::RT_LIST_META,
+                     key,
+                     "");
+    PStore kvstore = expdb.value().store;
+    auto ptxn = sess->getCtx()->createTransaction(kvstore);
+    if (!ptxn.ok()) {
+        return ptxn.status();
+    }
+    Expected<std::string> s1 =
+        genericPop(sess, kvstore, ptxn.value(), metaRk, rv, _pos);
+    if (s1.status().code() == ErrorCodes::ERR_NOTFOUND) {
+        return Command::fmtNull();
+    } else if (!s1.ok()) {
+        return s1.status();
+    }
+    auto s = sess->getCtx()->commitTransaction(ptxn.value());
+    if (s.ok()) {
+        return Command::fmtBulk(s1.value());
+    } else if (s.status().code() != ErrorCodes::ERR_COMMIT_RETRY) {
+        return s.status();
+    }
+    return s.status();
+  }
+  Expected<std::string> tryPop(Session* sess, const std::vector<std::string>& keys) {
+    auto server = sess->getServerEntry();
+    SessionCtx* pCtx = sess->getCtx();
+    INVARIANT(pCtx != nullptr);
+    for (const auto& key : keys){
+        auto expdb = server->getSegmentMgr()->getDbWithKeyLock(
+            sess, key, mgl::LockMode::LOCK_X);
+        if (!expdb.ok()) {
+            continue;
+        }
+        Expected<RecordValue> rv =
+            Command::expireKeyIfNeeded(sess, key, RecordType::RT_LIST_META);
+        if (rv.status().code() == ErrorCodes::ERR_EXPIRED ||
+            rv.status().code() == ErrorCodes::ERR_NOTFOUND) {
+            continue;
+        } else if (!rv.ok()) {
+            continue;
+        }
+
+        // record exists
+        RecordKey metaRk(expdb.value().chunkId,
+                        pCtx->getDbId(),
+                        RecordType::RT_LIST_META,
+                        key,
+                        "");
+        PStore kvstore = expdb.value().store;
+        auto ptxn = sess->getCtx()->createTransaction(kvstore);
+        if (!ptxn.ok()) {
+            continue;
+        }
+        Expected<std::string> s1 =
+            genericPop(sess, kvstore, ptxn.value(), metaRk, rv, _pos);
+        if (s1.status().code() == ErrorCodes::ERR_NOTFOUND) {
+            continue;
+        } else if (!s1.ok()) {
+            continue;
+        }
+        auto s = sess->getCtx()->commitTransaction(ptxn.value());
+        if (s.ok()) {
+            return Command::fmtBulk(s1.value());
+        } else if (s.status().code() != ErrorCodes::ERR_COMMIT_RETRY) {
+            return s.status();
+        }
+    }
+    return {ErrorCodes::ERR_NOTFOUND, "not found"};
+  }
+  
+  Expected<std::string> run(Session* sess) final {
+    const std::vector<std::string>& args = sess->getArgs();
+    std::vector<std::string> keys;
+    for (size_t i=1; i+1<args.size(); i++) {
+        keys.push_back(args[i]);
+    }
+    Expected<uint64_t> timeout = tendisplus::stoull(sess->getArgs().back());
+    if (!timeout.ok()) {
+        return timeout.status();
+    }
+    auto status = tryPop(sess, keys);
+    if(status.ok()){
+        return status;
+    }
+    startBlocking(sess, keys, timeout.value());
+    return {ErrorCodes::ERR_BLOCKCMD, "block command"};
+  }
+  
+  void startBlocking(Session* sess, const std::vector<std::string>& keys, uint64_t timeout) {
+    auto nSess = dynamic_cast<NetSession*>(sess);
+    if (!nSess) {
+        return;
+    }
+    nSess->blockOnKeys(keys);
+    auto startTs = sess->getCtx()->getProcessPacketStart();
+    INVARIANT_D(startTs > 0);
+    std::cout << "startTs: " << startTs << std::endl;
+    
+    auto duration_sec = std::chrono::duration<double>(timeout);
+    auto microsec = std::chrono::duration_cast<std::chrono::microseconds>(duration_sec);
+    std::cout << "timeout in microseconds: " << microsec.count() << std::endl;
+
+    nSess->addBlockTimer(microsec.count());
+    nSess->setBlockingCompletionCb([this, nSess, keys]() {
+        return tryPop(nSess, keys);
+    });
+  }
+ private:
+  ListPos _pos;
+};
+
+class BLPopCommand: public BlockPopWrapper{
+ public:
+  BLPopCommand() : BlockPopWrapper(ListPos::LP_HEAD, "wF") {}
+} blpopCommand;
+
+class BRPopCommand : public BlockPopWrapper {
+ public:
+  BRPopCommand() : BlockPopWrapper(ListPos::LP_TAIL, "wF") {}
+} brpopCommand;
+
 class ListPushWrapper : public Command {
  public:
   explicit ListPushWrapper(const std::string& name,
@@ -368,6 +538,7 @@ class ListPushWrapper : public Command {
       }
       auto s = sess->getCtx()->commitTransaction(ptxn.value());
       if (s.ok()) {
+        server->wakeUpByKey(key, valargs.size());
         return s1.value();
       } else if (s.status().code() != ErrorCodes::ERR_COMMIT_RETRY) {
         return s.status();
