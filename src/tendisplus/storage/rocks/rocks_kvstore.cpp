@@ -37,7 +37,11 @@
 #include "rocksdb/utilities/table_properties_collectors.h"
 
 #include "tendisplus/server/server_entry.h"
+#include "tendisplus/server/server_params.h"
 #include "tendisplus/server/session.h"
+#include "tendisplus/storage/rocks/compaction_service.h"
+#include "tendisplus/storage/rocks/nfs_filesystem_simple.h"
+#include "tendisplus/storage/rocks/nfs_filesystem.h"
 #include "tendisplus/storage/rocks/rocks_kvttlcompactfilter.h"
 #include "tendisplus/storage/varint.h"
 #include "tendisplus/utils/invariant.h"
@@ -46,7 +50,6 @@
 #include "tendisplus/utils/sync_point.h"
 #include "tendisplus/utils/time.h"
 #include "tendisplus/utils/time_record.h"
-
 namespace tendisplus {
 
 #ifndef NO_VERSIONEP
@@ -2204,10 +2207,88 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
       _cfDescs.push_back(
         rocksdb::ColumnFamilyDescriptor("binlog_cf", binlogColumnFamilyOpts));
     }
+
+    bool use_nfs = false;
+    const std::string& db_path = dbPath();
+    std::string nfs_url;
+    std::string local_prefix;
+    std::string csa_address;
+    bool nfs_enabled = false;
+    
+    // Priority 1: Profile
+    if (gParams && gParams->nfsEnabled) {
+      nfs_enabled = true;
+      nfs_url = gParams->nfsUrl;
+      local_prefix = gParams->nfsLocalPrefix;
+      csa_address = gParams->csaAddress;
+      LOG(INFO) << "NFS config from file: enabled=" << nfs_enabled
+                << ", url=" << nfs_url
+                << ", local_prefix=" << local_prefix
+                << ", csa_address=" << csa_address;
+    }
+    
+    // If NFS is enabled but local_prefix is not configured, use dbPath
+    if (nfs_enabled && local_prefix.empty()) {
+      local_prefix = db_path;
+    }
+    
+    // Enable NFS
+    if (nfs_enabled && !nfs_url.empty() && !local_prefix.empty()) {
+      LOG(INFO) << "NFS configuration:"
+                << " nfs_url=" << nfs_url
+                << ", local_prefix=" << local_prefix
+                << ", csa_address=" << csa_address;
+      
+      rocksdb::Status nfs_status =
+        rocksdb::NewNFSFileSystem(nfs_url, local_prefix, &_nfsFileSystem);
+        // rocksdb::NewNFSFileSystemSimple(nfs_url, local_prefix, &_nfsFileSystem);
+      
+      if (!nfs_status.ok()) {
+        LOG(ERROR) << "Failed to create NFS FileSystem: "
+                   << nfs_status.ToString()
+                   << ", falling back to default filesystem";
+      } else if (_nfsFileSystem) {
+        _nfsEnv = rocksdb::NewCompositeEnv(_nfsFileSystem);
+        if (_nfsEnv) {
+          use_nfs = true;
+          LOG(INFO) << "NFS FileSystem enabled successfully"
+                    << ", nfs_url: " << nfs_url
+                    << ", local_prefix: " << local_prefix
+                    << ", csa_address: " << csa_address;
+        }
+      }
+    } else {
+      LOG(INFO) << "NFS FileSystem disabled, using local filesystem"
+                << ", dbPath: " << db_path;
+    }
+
     if (_txnMode == TxnMode::TXN_OPT) {
       rocksdb::OptimisticTransactionDB* tmpDb = nullptr;
       rocksdb::Options dbOpts = options();
       dbOpts.create_missing_column_families = true;
+      
+      // Apply NFS environment
+      if (use_nfs && _nfsEnv) {
+        dbOpts.env = _nfsEnv.get();
+        LOG(INFO) << "TXN_OPT: Using NFS FileSystem for db: " << dbname;
+      }
+      
+      std::vector<std::shared_ptr<rocksdb::TablePropertiesCollectorFactory>>
+        remote_table_properties_collector_factories;
+      auto& tmp_options = const_cast<rocksdb::Options&>(dbOpts);
+      auto& remote_listeners =
+        const_cast<std::vector<std::shared_ptr<rocksdb::EventListener>>&>(
+          dbOpts.listeners);
+      tmp_options.compaction_service =
+        std::make_shared<rocksdb::MyTestCompactionService>(
+          dbname,
+          tmp_options,
+          _stats,
+          remote_listeners,
+          remote_table_properties_collector_factories,
+          nfs_url,
+          local_prefix,
+          csa_address);
       auto status = rocksdb::OptimisticTransactionDB::Open(
         dbOpts,
         dbname,
@@ -2240,6 +2321,35 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
       rocksdb::Options dbOpts = options();
       dbOpts.create_missing_column_families = true;
       LOG(INFO) << "rocksdb Open,id:" << dbId() << " dbname:" << dbname;
+      
+      // Apply NFS environment
+      if (use_nfs && _nfsEnv) {
+        dbOpts.env = _nfsEnv.get();
+        LOG(INFO) << "TXN_PES: Using NFS FileSystem for db: " << dbname;
+      }
+      
+      std::vector<std::shared_ptr<rocksdb::TablePropertiesCollectorFactory>>
+        remote_table_properties_collector_factories;
+      auto& tmp_options = const_cast<rocksdb::Options&>(dbOpts);
+      auto& compaction_stats =
+        const_cast<std::shared_ptr<rocksdb::Statistics>&>(dbOpts.statistics);
+      auto& remote_listeners =
+        const_cast<std::vector<std::shared_ptr<rocksdb::EventListener>>&>(
+          dbOpts.listeners);
+      
+      tmp_options.compaction_service =
+        std::make_shared<rocksdb::MyTestCompactionService>(
+          dbname,
+          tmp_options,
+          compaction_stats,
+          remote_listeners,
+          remote_table_properties_collector_factories,
+          nfs_url,
+          local_prefix,
+          csa_address);
+
+      // rocksdb::DB* db;
+      // rocksdb::DB::Open(dbOpts, "/nfs/rocksdb_data", &db);
       // open two colum_family in pessimisticTranDB
       auto status = rocksdb::TransactionDB::Open(
         dbOpts, txnDbOptions, dbname, _cfDescs, &_cfHandles, &tmpDb);

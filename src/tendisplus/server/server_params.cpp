@@ -173,7 +173,7 @@ std::string removeQuotes(const std::string& v) {
   }
 
   auto tmp = v;
-  if (tmp[0] == '\"' && tmp[tmp.size() - 1] == '\"') {
+  if (tmp[0] == '"' && tmp[tmp.size() - 1] == '"') {
     tmp = tmp.substr(1, tmp.size() - 2);
   }
   return tmp;
@@ -185,7 +185,7 @@ std::string removeQuotesAndToLower(const std::string& v) {
     return tmp;
   }
 
-  if (tmp[0] == '\"' && tmp[tmp.size() - 1] == '\"') {
+  if (tmp[0] == '"' && tmp[tmp.size() - 1] == '"') {
     tmp = tmp.substr(1, tmp.size() - 2);
   }
   return tmp;
@@ -620,6 +620,12 @@ ServerParams::ServerParams() {
                                   enableClosePubSubConnection);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("enable-move-pubsub-request",
                                   enableMovePubSubRequest);
+
+  // NFS配置
+  REGISTER_VARS_DIFF_NAME("nfs.enabled", nfsEnabled);
+  REGISTER_VARS_DIFF_NAME("nfs.url", nfsUrl);
+  REGISTER_VARS_DIFF_NAME("nfs.local_prefix", nfsLocalPrefix);
+  REGISTER_VARS_DIFF_NAME("csa_address", csaAddress);
 }
 
 ServerParams::~ServerParams() {

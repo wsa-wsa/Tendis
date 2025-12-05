@@ -644,6 +644,13 @@ class ServerParams {
 
   bool enableClosePubSubConnection = true;
   bool enableMovePubSubRequest = true;
+
+  // NFS configuration
+  // When enabled, all paths starting with nfsLocalPrefix are redirected to nfsUrl
+  bool nfsEnabled = false;
+  std::string nfsUrl = "";           // NFS server URL, such as nfs://192.168.1.100/shared/rocksdb
+  std::string nfsLocalPrefix = "";   // Local path prefixes such as /mnt/nfs_rocksdb
+  std::string csaAddress = "";
 };
 
 extern std::shared_ptr<tendisplus::ServerParams> gParams;
