@@ -15,6 +15,7 @@
 #include <iostream>
 #include <list>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <typeinfo>
@@ -768,28 +769,43 @@ Status ServerParams::setRocksOption(const std::string& argname,
     errinfo = "not found arg:" + argname;
     return {ErrorCodes::ERR_PARSEOPT, errinfo};
   }
+
+  // CF options list - these options apply to column families
+  static const std::set<std::string> cfOptions = {
+    "enable_blob_files",
+    "min_blob_size",
+    "blob_file_size",
+    "blob_garbage_collection_age_cutoff",
+    "blob_garbage_collection_force_threshold",
+    "blob_compaction_readahead_size",
+    "blob_file_starting_level",
+    "prepopulate_blob_cache",
+    "enable_blob_garbage_collection",
+    "blob_compression_type",
+    "disable_auto_compactions",
+    "periodic_compaction_seconds",
+    "level0_file_num_compaction_trigger",
+    "level0_slowdown_writes_trigger",
+    "level0_stop_writes_trigger"};
+
   if (argArray.size() == 2) {
-    // pass configured RocksdbOptions when server starup
-    _rocksdbOptions[toLower(argArray[1])] = value;
-    return {ErrorCodes::ERR_OK, ""};
-  } else {
-    // pass configured RocksdbOptions when server starup
-    const std::string& cfname = toLower(argArray[1]);
-    auto cfOption = _rocksdbCFOptions.find(cfname);
-    if (cfOption == _rocksdbCFOptions.end()) {
-      auto ret = _rocksdbCFOptions.insert(
-        std::pair<std::string, ParamsMap>(cfname, ParamsMap()));
-      INVARIANT_D(ret.second);
-      if (!ret.second) {
-        LOG(ERROR) << "insert failed:" << cfname;
-        errinfo = "invalid rocksdb options:" + argname + " value:" + value;
-        return {ErrorCodes::ERR_PARSEOPT, errinfo};
-      }
-      cfOption = ret.first;
+    // Format: rocks.option_name
+    std::string optionName = toLower(argArray[1]);
+    if (cfOptions.count(optionName)) {
+      // CF option: apply to both column families
+      _rocksdbCFOptions["defaultcf"][optionName] = value;
+      _rocksdbCFOptions["binlogcf"][optionName] = value;
+    } else {
+      // DB-level option
+      _rocksdbOptions[optionName] = value;
     }
-    cfOption->second[toLower(argArray[2])] = value;
-    return {ErrorCodes::ERR_OK, ""};
+  } else {
+    // Format: rocks.cfname.option_name
+    std::string cfname = toLower(argArray[1]);
+    std::string optionName = toLower(argArray[2]);
+    _rocksdbCFOptions[cfname][optionName] = value;
   }
+  return {ErrorCodes::ERR_OK, ""};
 }
 
 Status ServerParams::setRocksOptionDynamic(const std::string& argname,
@@ -851,7 +867,7 @@ bool ServerParams::registerOnupdate(const std::string& name, funptr ptr) {
 
 std::string ServerParams::showAll() const {
   std::string ret;
-  for (auto iter : _mapServerParams) {
+  for (const auto& iter : _mapServerParams) {
     if (iter.second->getName() == "requirepass" ||
         iter.second->getName() == "masterauth") {
       ret += "  " + iter.second->getName() + ":******\n";
@@ -862,11 +878,19 @@ std::string ServerParams::showAll() const {
     }
   }
 
-  for (auto iter : _rocksdbOptions) {
+  for (const auto& iter : _rocksdbOptions) {
     ret += "  rocks." + iter.first + ":" + iter.second + "\n";
   }
 
-  ret.resize(ret.size() - 1);
+  for (const auto& cf : _rocksdbCFOptions) {
+    for (const auto& iter : cf.second) {
+      ret += "  rocks." + cf.first + "." + iter.first + ":" + iter.second + "\n";
+    }
+  }
+
+  if (!ret.empty()) {
+    ret.resize(ret.size() - 1);
+  }
   return ret;
 }
 
@@ -881,43 +905,47 @@ bool ServerParams::showVar(const std::string& key, std::string* info) const {
 
 bool ServerParams::showVar(const std::string& key,
                            std::vector<std::string>* info) const {
-  for (auto iter = _mapServerParams.begin(); iter != _mapServerParams.end();
-       iter++) {
+  for (const auto& iter : _mapServerParams) {
     if (redis_port::stringmatchlen(key.c_str(),
                                    key.size(),
-                                   iter->first.c_str(),
-                                   iter->first.size(),
+                                   iter.first.c_str(),
+                                   iter.first.size(),
                                    1)) {
-      info->push_back(iter->first);
-      info->push_back(iter->second->show());
+      info->push_back(iter.first);
+      info->push_back(iter.second->show());
     }
   }
-  for (auto iter = _rocksdbOptions.begin(); iter != _rocksdbOptions.end();
-       iter++) {
-    std::string hole_param = "rocks." + iter->first;
+
+  // DB-level options
+  for (const auto& iter : _rocksdbOptions) {
+    std::string param = "rocks." + iter.first;
     if (redis_port::stringmatchlen(
-          key.c_str(), key.size(), hole_param.c_str(), hole_param.size(), 1)) {
-      info->push_back(hole_param);
-      info->push_back(iter->second);
+          key.c_str(), key.size(), param.c_str(), param.size(), 1)) {
+      info->push_back(param);
+      info->push_back(iter.second);
     }
   }
-  for (auto cf = _rocksdbCFOptions.begin(); cf != _rocksdbCFOptions.end();
-       cf++) {
-    for (auto iter = cf->second.begin(); iter != cf->second.end(); iter++) {
-      std::string hole_param = "rocks." + cf->first + "." + iter->first;
-      if (redis_port::stringmatchlen(key.c_str(),
-                                     key.size(),
-                                     hole_param.c_str(),
-                                     hole_param.size(),
-                                     1)) {
-        info->push_back(hole_param);
-        info->push_back(iter->second);
+
+  // CF-level options: match both "rocks.cfname.option" and "rocks.option"
+  for (const auto& cf : _rocksdbCFOptions) {
+    for (const auto& iter : cf.second) {
+      std::string cfParam = "rocks." + cf.first + "." + iter.first;
+      std::string shortParam = "rocks." + iter.first;
+
+      bool matchCf = redis_port::stringmatchlen(
+        key.c_str(), key.size(), cfParam.c_str(), cfParam.size(), 1);
+      bool matchShort = redis_port::stringmatchlen(
+        key.c_str(), key.size(), shortParam.c_str(), shortParam.size(), 1);
+
+      if (matchCf || matchShort) {
+        info->push_back(cfParam);
+        info->push_back(iter.second);
       }
     }
   }
-  if (info->empty())
-    return false;
-  return true;
+
+  return !info->empty();
+}
 }
 
 Status ServerParams::rewriteConfig() const {

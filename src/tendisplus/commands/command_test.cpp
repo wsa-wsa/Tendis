@@ -2343,11 +2343,15 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
   asio::ip::tcp::socket socket(ioContext);
   NetSession sess(svr, std::move(socket), 1, false, nullptr, nullptr);
 
+  // rocks.enable_blob_files now returns both CF values
   sess.setArgs({"CONFIG", "GET", "rocks.enable_blob_files"});
   auto expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
-  EXPECT_EQ("*2\r\n$23\r\nrocks.enable_blob_files\r\n$1\r\n1\r\n",
-            expect.value());
+  // Should return 4 elements: defaultcf key, value, binlogcf key, value
+  EXPECT_TRUE(expect.value().find("rocks.defaultcf.enable_blob_files") !=
+              std::string::npos);
+  EXPECT_TRUE(expect.value().find("rocks.binlogcf.enable_blob_files") !=
+              std::string::npos);
 
   sess.setArgs({"CONFIG", "GET", "rocks.binlogcf.enable_blob_files"});
   expect = Command::runSessionCmd(&sess);
@@ -2355,48 +2359,58 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
   EXPECT_EQ("*2\r\n$32\r\nrocks.binlogcf.enable_blob_files\r\n$1\r\n1\r\n",
             expect.value());
 
+  // rocks.blob_garbage_collection_age_cutoff now returns both CF values
   sess.setArgs({"CONFIG", "GET", "rocks.blob_garbage_collection_age_cutoff"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
-  EXPECT_EQ(
-    "*2\r\n$40\r\nrocks.blob_garbage_collection_age_cutoff\r\n$4\r\n0.12\r\n",
-    expect.value());
+  EXPECT_TRUE(
+    expect.value().find("rocks.defaultcf.blob_garbage_collection_age_cutoff") !=
+    std::string::npos);
+  EXPECT_TRUE(
+    expect.value().find("rocks.binlogcf.blob_garbage_collection_age_cutoff") !=
+    std::string::npos);
 
+  // rocks.blob_compression_type now returns both CF values
   sess.setArgs({"CONFIG", "GET", "rocks.blob_compression_type"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
-  EXPECT_EQ("*2\r\n$27\r\nrocks.blob_compression_type\r\n$3\r\nlz4\r\n",
-            expect.value());
+  EXPECT_TRUE(expect.value().find("rocks.defaultcf.blob_compression_type") !=
+              std::string::npos);
+  EXPECT_TRUE(expect.value().find("rocks.binlogcf.blob_compression_type") !=
+              std::string::npos);
 
   sess.setArgs({"CONFIG", "SET", "rocks.blob_compression_type", "snappy"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
 
-  sess.setArgs({"CONFIG", "GET", "rocks.blob_compression_type"});
+  sess.setArgs({"CONFIG", "GET", "rocks.defaultcf.blob_compression_type"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
-  EXPECT_EQ("*2\r\n$27\r\nrocks.blob_compression_type\r\n$6\r\nsnappy\r\n",
-            expect.value());
+  EXPECT_EQ(
+    "*2\r\n$36\r\nrocks.defaultcf.blob_compression_type\r\n$6\r\nsnappy\r\n",
+    expect.value());
 
   sess.setArgs({"CONFIG", "SET", "rocks.blob_compression_type", "snappy111"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_FALSE(expect.ok());
 
-  sess.setArgs({"CONFIG", "GET", "rocks.blob_compression_type"});
+  sess.setArgs({"CONFIG", "GET", "rocks.defaultcf.blob_compression_type"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
-  EXPECT_EQ("*2\r\n$27\r\nrocks.blob_compression_type\r\n$6\r\nsnappy\r\n",
-            expect.value());
+  EXPECT_EQ(
+    "*2\r\n$36\r\nrocks.defaultcf.blob_compression_type\r\n$6\r\nsnappy\r\n",
+    expect.value());
 
   sess.setArgs({"CONFIG", "SET", "rocks.blob_compression_type", "lz4"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
 
-  sess.setArgs({"CONFIG", "GET", "rocks.blob_compression_type"});
+  sess.setArgs({"CONFIG", "GET", "rocks.defaultcf.blob_compression_type"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
-  EXPECT_EQ("*2\r\n$27\r\nrocks.blob_compression_type\r\n$3\r\nlz4\r\n",
-            expect.value());
+  EXPECT_EQ(
+    "*2\r\n$36\r\nrocks.defaultcf.blob_compression_type\r\n$3\r\nlz4\r\n",
+    expect.value());
 
   std::stringstream ss;
 
@@ -2471,16 +2485,21 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
     EXPECT_EQ(store->getCFOption(ColumnFamilyNumber::ColumnFamily_Default,
                                  "rocks.periodic_compaction_seconds"),
               3);
+    EXPECT_EQ(store->getCFOption(ColumnFamilyNumber::ColumnFamily_Binlog,
+                                 "rocks.periodic_compaction_seconds"),
+              3);
   }
 
+  // config get rocks.xxx returns both CF values
   sess.setArgs({"CONFIG", "GET", "rocks.periodic_compaction_seconds"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
-  ss.str("");
-  Command::fmtMultiBulkLen(ss, 2);
-  Command::fmtBulk(ss, "rocks.periodic_compaction_seconds");
-  Command::fmtBulk(ss, "3");
-  EXPECT_EQ(ss.str(), expect.value());
+  EXPECT_TRUE(
+    expect.value().find("rocks.defaultcf.periodic_compaction_seconds") !=
+    std::string::npos);
+  EXPECT_TRUE(
+    expect.value().find("rocks.binlogcf.periodic_compaction_seconds") !=
+    std::string::npos);
 
   // we will adjust these tests when we use rocksdb(version > 6.11)
   std::string err;
@@ -2941,50 +2960,59 @@ void testRocksCFOptionConfig(std::shared_ptr<ServerEntry> svr,
 void testCFConfigSetAndGet(std::shared_ptr<ServerEntry> master) {
   auto ctx = std::make_shared<asio::io_context>();
   auto session = makeSession(master, ctx);
-  {
-    session->setArgs({"config", "set", "rocks.enable_blob_files", "1"});
-    auto expect = Command::runSessionCmd(session.get());
-    EXPECT_EQ(expect.ok(), true);
-    testRocksCFOptionConfig(master, 1, 1);
-  }
 
-  {
-    session->setArgs({"config", "set", "rocks.enable_blob_files", "0"});
-    auto expect = Command::runSessionCmd(session.get());
-    EXPECT_EQ(expect.ok(), true);
-    testRocksCFOptionConfig(master, 0, 0);
-  }
+  // Test: rocks.xxx sets both CFs
+  session->setArgs({"config", "set", "rocks.enable_blob_files", "1"});
+  auto expect = Command::runSessionCmd(session.get());
+  EXPECT_TRUE(expect.ok());
+  testRocksCFOptionConfig(master, 1, 1);
 
-  {
-    session->setArgs(
-      {"config", "set", "rocks.defaultcf.enable_blob_files", "1"});
-    auto expect = Command::runSessionCmd(session.get());
-    EXPECT_EQ(expect.ok(), true);
-    testRocksCFOptionConfig(master, 1, 0);
-  }
+  // Verify config get returns both CF values
+  session->setArgs({"config", "get", "rocks.enable_blob_files"});
+  expect = Command::runSessionCmd(session.get());
+  EXPECT_TRUE(expect.ok());
+  EXPECT_TRUE(expect.value().find("rocks.defaultcf.enable_blob_files") !=
+              std::string::npos);
+  EXPECT_TRUE(expect.value().find("rocks.binlogcf.enable_blob_files") !=
+              std::string::npos);
 
-  {
-    session->setArgs(
-      {"config", "set", "rocks.defaultcf.enable_blob_files", "0"});
-    auto expect = Command::runSessionCmd(session.get());
-    EXPECT_EQ(expect.ok(), true);
-    testRocksCFOptionConfig(master, 0, 0);
-  }
-  {
-    session->setArgs(
-      {"config", "set", "rocks.binlogcf.enable_blob_files", "1"});
-    auto expect = Command::runSessionCmd(session.get());
-    EXPECT_EQ(expect.ok(), true);
-    testRocksCFOptionConfig(master, 0, 1);
-  }
+  // Reset to 0
+  session->setArgs({"config", "set", "rocks.enable_blob_files", "0"});
+  expect = Command::runSessionCmd(session.get());
+  EXPECT_TRUE(expect.ok());
+  testRocksCFOptionConfig(master, 0, 0);
 
-  {
-    session->setArgs(
-      {"config", "set", "rocks.binlogcf.enable_blob_files", "0"});
-    auto expect = Command::runSessionCmd(session.get());
-    EXPECT_EQ(expect.ok(), true);
-    testRocksCFOptionConfig(master, 0, 0);
-  }
+  // Test: rocks.defaultcf.xxx sets only defaultcf
+  session->setArgs({"config", "set", "rocks.defaultcf.enable_blob_files", "1"});
+  expect = Command::runSessionCmd(session.get());
+  EXPECT_TRUE(expect.ok());
+  testRocksCFOptionConfig(master, 1, 0);
+
+  session->setArgs({"config", "get", "rocks.defaultcf.enable_blob_files"});
+  expect = Command::runSessionCmd(session.get());
+  EXPECT_EQ("*2\r\n$32\r\nrocks.defaultcf.enable_blob_files\r\n$1\r\n1\r\n",
+            expect.value());
+
+  // Reset
+  session->setArgs({"config", "set", "rocks.defaultcf.enable_blob_files", "0"});
+  Command::runSessionCmd(session.get());
+  testRocksCFOptionConfig(master, 0, 0);
+
+  // Test: rocks.binlogcf.xxx sets only binlogcf
+  session->setArgs({"config", "set", "rocks.binlogcf.enable_blob_files", "1"});
+  expect = Command::runSessionCmd(session.get());
+  EXPECT_TRUE(expect.ok());
+  testRocksCFOptionConfig(master, 0, 1);
+
+  session->setArgs({"config", "get", "rocks.binlogcf.enable_blob_files"});
+  expect = Command::runSessionCmd(session.get());
+  EXPECT_EQ("*2\r\n$32\r\nrocks.binlogcf.enable_blob_files\r\n$1\r\n1\r\n",
+            expect.value());
+
+  // Reset
+  session->setArgs({"config", "set", "rocks.binlogcf.enable_blob_files", "0"});
+  Command::runSessionCmd(session.get());
+  testRocksCFOptionConfig(master, 0, 0);
 }
 TEST(Command, rocksdbCfOptionsCommand) {
   const auto guard = MakeGuard([]() { destroyEnv(); });
