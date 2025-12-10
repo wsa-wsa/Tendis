@@ -1426,7 +1426,7 @@ rocksdb::Options RocksKVStore::options(const std::string cf) {
 }
 
 rocksdb::Options RocksKVStore::defaultColumnOptions() {
-  return options();
+  return options("defaultcf");
 }
 
 // Binlog Column different from default
@@ -3249,6 +3249,8 @@ Status RocksKVStore::setOptionDynamic(const std::string& option,
   auto cf = ColumnFamilyNumber::ColumnFamily_All;
   if (isCfOption) {
     if (specialCf == "") {
+      cf = ColumnFamilyNumber::ColumnFamily_All;
+    } else if (specialCf == "defaultcf") {
       cf = ColumnFamilyNumber::ColumnFamily_Default;
     } else if (specialCf == "binlogcf") {
       cf = ColumnFamilyNumber::ColumnFamily_Binlog;
