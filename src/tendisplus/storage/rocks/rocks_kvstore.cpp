@@ -39,6 +39,7 @@
 #include "tendisplus/server/server_entry.h"
 #include "tendisplus/server/session.h"
 #include "tendisplus/storage/rocks/rocks_kvttlcompactfilter.h"
+#include "tendisplus/storage/rocks/rocks_option_defs.h"
 #include "tendisplus/storage/varint.h"
 #include "tendisplus/utils/invariant.h"
 #include "tendisplus/utils/scopeguard.h"
@@ -3226,98 +3227,65 @@ Status RocksKVStore::recoveryFromBgError() {
 
 Status RocksKVStore::setOptionDynamic(const std::string& option,
                                       const std::string& value) {
-  std::unordered_map<std::string, std::string> map;
-  if (option.substr(0, 6) != "rocks.") {
-    return {ErrorCodes::ERR_INTERNAL, option + " is not rocksdb option"};
+  // Parse option using centralized definitions
+  auto parsed = RocksOptionDefs::parseOption(option);
+  if (!parsed.isValid()) {
+    return {ErrorCodes::ERR_INTERNAL,
+            option + " is not a valid rocksdb option"};
   }
 
-  static std::set<std::string> rocksdb_dynamic_options = {
-    "rocks.max_background_jobs",
-    "rocks.max_open_files",
-    "rocks.max_subcompactions",
-  };
-  static std::set<std::string> rocksdb_cf_dynamic_options = {
-    "rocks.enable_blob_files",
-    "rocks.min_blob_size",
-    "rocks.blob_file_size",
-    "rocks.blob_garbage_collection_age_cutoff",
-    "rocks.blob_garbage_collection_force_threshold",
-    "rocks.blob_compaction_readahead_size",
-    "rocks.blob_file_starting_level",
-    "rocks.prepopulate_blob_cache",
-    "rocks.enable_blob_garbage_collection",
-    "rocks.blob_compression_type",
-    "rocks.disable_auto_compactions",
-    "rocks.periodic_compaction_seconds",
-    "rocks.level0_file_num_compaction_trigger",
-    "rocks.level0_slowdown_writes_trigger",
-    "rocks.level0_stop_writes_trigger"};
-  // option, example: "rocks.binlogcf.enable_blob_files"
-  // new_option, example: "rocks.enable_blob_files"
-  // short_option, example: "enable_blob_files"
-  std::string new_option = option;
-  std::string short_option = "";
-  auto argArray = tendisplus::stringSplit(option, ".");
-  std::string specialCf = "";
-  if (argArray.size() == 2) {
-    // example: "rocks.enable_blob_files"
-    short_option = argArray[1];
-  } else if (argArray.size() == 3) {
-    // example: "rocks.binlogcf.enable_blob_files"
-    specialCf = argArray[1];
-    short_option = argArray[2];
-    new_option = argArray[0] + "." + argArray[2];
-  }
-  bool isDbOption = rocksdb_dynamic_options.count(new_option);
-  bool isCfOption = rocksdb_cf_dynamic_options.count(new_option);
+  const std::string& optionName = parsed.name;
 
-  if (!isDbOption && !isCfOption) {
-    return {ErrorCodes::ERR_INTERNAL, option + " can't change dynamically"};
+  // Validate option can be changed dynamically
+  auto desc = RocksOptionDefs::getOptionDescriptor(optionName);
+  if (desc == nullptr) {
+    LOG(WARNING) << "Unknown RocksDB option: " << optionName
+                 << ", attempting to apply anyway";
+  } else if (desc->mutability != RocksOptionMutability::DYNAMIC) {
+    return {ErrorCodes::ERR_INTERNAL,
+            option + " is a static option and can't be changed at runtime"};
   }
 
-  auto cf = ColumnFamilyNumber::ColumnFamily_All;
-  if (isCfOption) {
-    if (specialCf == "") {
-      cf = ColumnFamilyNumber::ColumnFamily_All;
-    } else if (specialCf == "defaultcf") {
-      cf = ColumnFamilyNumber::ColumnFamily_Default;
-    } else if (specialCf == "binlogcf") {
-      cf = ColumnFamilyNumber::ColumnFamily_Binlog;
-    } else {
-      return {ErrorCodes::ERR_INTERNAL,
-              "ColumnFamily " + specialCf + " not exist"};
-    }
-  }
+  // Prepare the option value (handle special cases)
+  std::unordered_map<std::string, std::string> optionMap;
+  optionMap[optionName] = (optionName == "blob_compression_type")
+                            ? rocksGetCompressionTypeStr(value)
+                            : value;
 
-  if (short_option == "blob_compression_type") {
-    map[short_option] = rocksGetCompressionTypeStr(value);
-  } else {
-    map[short_option] = value;
-  }
-
-  if (isDbOption) {
-    auto s = getBaseDB()->SetDBOptions(map);
+  // Apply based on option scope
+  if (parsed.isDBOption() || parsed.isUnknown()) {
+    // DB-level option (or unknown - treat as DB for backward compatibility)
+    auto s = getBaseDB()->SetDBOptions(optionMap);
     if (!s.ok()) {
       return {ErrorCodes::ERR_INTERNAL, s.ToString()};
     }
+  } else if (parsed.isCFOption()) {
+    // CF-level option: apply based on ColumnFamilyTarget
+    auto applyCF = [&](ColumnFamilyNumber cfNum) -> Status {
+      auto s = getBaseDB()->SetOptions(getColumnFamilyHandle(cfNum), optionMap);
+      if (!s.ok()) {
+        return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+      }
+      return {ErrorCodes::ERR_OK, ""};
+    };
+
+    switch (parsed.cfTarget) {
+      case ColumnFamilyTarget::ALL:
+        RET_IF_ERR(applyCF(ColumnFamilyNumber::ColumnFamily_Default));
+        RET_IF_ERR(applyCF(ColumnFamilyNumber::ColumnFamily_Binlog));
+        break;
+      case ColumnFamilyTarget::DEFAULT:
+        RET_IF_ERR(applyCF(ColumnFamilyNumber::ColumnFamily_Default));
+        break;
+      case ColumnFamilyTarget::BINLOG:
+        RET_IF_ERR(applyCF(ColumnFamilyNumber::ColumnFamily_Binlog));
+        break;
+    }
   } else {
-    if (cf == ColumnFamilyNumber::ColumnFamily_All ||
-        cf == ColumnFamilyNumber::ColumnFamily_Default) {
-      auto s = getBaseDB()->SetOptions(
-        getColumnFamilyHandle(ColumnFamilyNumber::ColumnFamily_Default), map);
-      if (!s.ok()) {
-        return {ErrorCodes::ERR_INTERNAL, s.ToString()};
-      }
-    }
-    if (cf == ColumnFamilyNumber::ColumnFamily_All ||
-        cf == ColumnFamilyNumber::ColumnFamily_Binlog) {
-      auto s = getBaseDB()->SetOptions(
-        getColumnFamilyHandle(ColumnFamilyNumber::ColumnFamily_Binlog), map);
-      if (!s.ok()) {
-        return {ErrorCodes::ERR_INTERNAL, s.ToString()};
-      }
-    }
+    return {ErrorCodes::ERR_INTERNAL,
+            "Cannot determine scope for option: " + optionName};
   }
+
   return {ErrorCodes::ERR_OK, ""};
 }
 

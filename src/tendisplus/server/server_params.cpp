@@ -25,6 +25,7 @@
 #include "rocksdb/tendis_extension.h"
 
 #include "tendisplus/server/server_entry.h"
+#include "tendisplus/storage/rocks/rocks_option_defs.h"
 #include "tendisplus/utils/invariant.h"
 #include "tendisplus/utils/status.h"
 #include "tendisplus/utils/string.h"
@@ -759,52 +760,41 @@ Status ServerParams::checkParams() {
 
 Status ServerParams::setRocksOption(const std::string& argname,
                                     const std::string& value) {
-  std::string errinfo;
-  auto argArray = tendisplus::stringSplit(argname, ".");
-  if (argArray.size() != 2 && argArray.size() != 3) {
-    errinfo = "not found arg:" + argname;
-    return {ErrorCodes::ERR_PARSEOPT, errinfo};
-  }
-  if (argArray[0] != "rocks") {
-    errinfo = "not found arg:" + argname;
-    return {ErrorCodes::ERR_PARSEOPT, errinfo};
+  // Parse option using centralized definitions
+  auto parsed = RocksOptionDefs::parseOption(argname);
+
+  if (!parsed.isValid()) {
+    // Fallback: check if it's a valid format but unknown option
+    if (!RocksOptionDefs::hasRocksPrefix(argname)) {
+      return {ErrorCodes::ERR_PARSEOPT, "not found arg:" + argname};
+    }
+    // Unknown option - store as DB option for backward compatibility
+    std::string optName = argname.substr(RocksOptionDefs::kRocksPrefixLen);
+    LOG(WARNING) << "Unknown RocksDB option: " << argname
+                 << ", storing as DB-level option";
+    _rocksdbOptions[toLower(optName)] = value;
+    return {ErrorCodes::ERR_OK, ""};
   }
 
-  // CF options list - these options apply to column families
-  static const std::set<std::string> cfOptions = {
-    "enable_blob_files",
-    "min_blob_size",
-    "blob_file_size",
-    "blob_garbage_collection_age_cutoff",
-    "blob_garbage_collection_force_threshold",
-    "blob_compaction_readahead_size",
-    "blob_file_starting_level",
-    "prepopulate_blob_cache",
-    "enable_blob_garbage_collection",
-    "blob_compression_type",
-    "disable_auto_compactions",
-    "periodic_compaction_seconds",
-    "level0_file_num_compaction_trigger",
-    "level0_slowdown_writes_trigger",
-    "level0_stop_writes_trigger"};
+  std::string optionName = toLower(parsed.name);
 
-  if (argArray.size() == 2) {
-    // Format: rocks.option_name
-    std::string optionName = toLower(argArray[1]);
-    if (cfOptions.count(optionName)) {
-      // CF option: apply to both column families
-      _rocksdbCFOptions["defaultcf"][optionName] = value;
-      _rocksdbCFOptions["binlogcf"][optionName] = value;
+  // Store based on option scope
+  if (parsed.isCFOption()) {
+    std::string cfName = parsed.getCFName();
+    if (cfName.empty()) {
+      // Apply to all CFs
+      for (const auto& cf : RocksOptionDefs::getAllCFNames()) {
+        _rocksdbCFOptions[cf][optionName] = value;
+      }
     } else {
-      // DB-level option
-      _rocksdbOptions[optionName] = value;
+      // Apply to specific CF
+      _rocksdbCFOptions[cfName][optionName] = value;
     }
   } else {
-    // Format: rocks.cfname.option_name
-    std::string cfname = toLower(argArray[1]);
-    std::string optionName = toLower(argArray[2]);
-    _rocksdbCFOptions[cfname][optionName] = value;
+    // DB-level option (or unknown)
+    _rocksdbOptions[optionName] = value;
   }
+
   return {ErrorCodes::ERR_OK, ""};
 }
 
@@ -842,7 +832,7 @@ Status ServerParams::setVar(const std::string& name,
     // change serverparam and rocksoptions when running
     LOG(INFO) << "ServerParams setVar dynamic, " << argname << ": " << value;
     if (iter == _mapServerParams.end()) {
-      if (argname.substr(0, 6) == "rocks.") {
+      if (RocksOptionDefs::hasRocksPrefix(argname)) {
         Status s = setRocksOptionDynamic(argname, value);
         RET_IF_ERR(s);
         return setRocksOption(argname, value);
