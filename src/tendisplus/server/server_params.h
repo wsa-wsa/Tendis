@@ -37,19 +37,28 @@ std::string removeQuotes(const std::string& v);
 std::string removeQuotesAndToLower(const std::string& v);
 void NoUseWarning(const std::string& name);
 
+// Variable types for distinguishing Tendis vs RocksDB options
+enum class VarType {
+  TENDIS,      // Normal Tendis config
+  ROCKS_DB,    // RocksDB DB-level option
+  ROCKS_CF,    // RocksDB CF-level option (uses RocksDB default, can be modified)
+};
+
 class BaseVar {
  public:
   BaseVar(const std::string& s,
           void* v,
           checkfunptr ptr,
           preProcess preFun,
-          bool allowDS)
+          bool allowDS,
+          VarType vt = VarType::TENDIS)
     : name(s),
       value(v),
       Onupdate(nullptr),
       checkFun(ptr),
       preProcessFun(preFun),
-      allowDynamicSet(allowDS) {
+      allowDynamicSet(allowDS),
+      varType(vt) {
     if (v == NULL) {
       assert(false);
       return;
@@ -79,6 +88,10 @@ class BaseVar {
     return allowDynamicSet;
   }
 
+  VarType getVarType() const {
+    return varType;
+  }
+
  protected:
   virtual Status set(const std::string& value, bool startup) = 0;
   virtual bool check(const std::string& value,
@@ -97,6 +110,7 @@ class BaseVar {
   preProcess preProcessFun =
     NULL;  // pre process for the value, such as remove the quotes
   bool allowDynamicSet = false;
+  VarType varType = VarType::TENDIS;
 };
 
 class StringVar : public BaseVar {
@@ -105,8 +119,9 @@ class StringVar : public BaseVar {
             void* v,
             checkfunptr ptr,
             preProcess preFun,
-            bool allowDynamicSet)
-    : BaseVar(name, v, ptr, preFun, allowDynamicSet),
+            bool allowDynamicSet,
+            VarType vt = VarType::TENDIS)
+    : BaseVar(name, v, ptr, preFun, allowDynamicSet, vt),
       _defaultValue(*reinterpret_cast<std::string*>(value)) {
     if (!preProcessFun) {
       preProcessFun = removeQuotes;
@@ -148,8 +163,9 @@ class IntVar : public BaseVar {
          preProcess preFun,
          int64_t minVal,
          int64_t maxVal,
-         bool allowDynamicSet)
-    : BaseVar(name, v, ptr, preFun, allowDynamicSet),
+         bool allowDynamicSet,
+         VarType vt = VarType::TENDIS)
+    : BaseVar(name, v, ptr, preFun, allowDynamicSet, vt),
       _defaultValue(*reinterpret_cast<int*>(value)),
       _minVal(minVal),
       _maxVal(maxVal) {}
@@ -198,8 +214,9 @@ class Int64Var : public BaseVar {
            preProcess preFun,
            int64_t minVal,
            int64_t maxVal,
-           bool allowDynamicSet)
-    : BaseVar(name, v, ptr, preFun, allowDynamicSet),
+           bool allowDynamicSet,
+           VarType vt = VarType::TENDIS)
+    : BaseVar(name, v, ptr, preFun, allowDynamicSet, vt),
       _defaultValue(*reinterpret_cast<int64_t*>(value)),
       _minVal(minVal),
       _maxVal(maxVal) {}
@@ -245,8 +262,9 @@ class FloatVar : public BaseVar {
            void* v,
            checkfunptr ptr,
            preProcess preFun,
-           bool allowDynamicSet)
-    : BaseVar(name, v, ptr, preFun, allowDynamicSet),
+           bool allowDynamicSet,
+           VarType vt = VarType::TENDIS)
+    : BaseVar(name, v, ptr, preFun, allowDynamicSet, vt),
       _defaultValue(*reinterpret_cast<float*>(value)) {}
   virtual std::string show() const {
     return std::to_string(*reinterpret_cast<float*>(value));
@@ -283,8 +301,9 @@ class DoubleVar : public BaseVar {
             void* v,
             checkfunptr ptr,
             preProcess preFun,
-            bool allowDynamicSet)
-    : BaseVar(name, v, ptr, preFun, allowDynamicSet),
+            bool allowDynamicSet,
+            VarType vt = VarType::TENDIS)
+    : BaseVar(name, v, ptr, preFun, allowDynamicSet, vt),
       _defaultValue(*reinterpret_cast<double*>(value)) {}
   virtual std::string show() const {
     return std::to_string(*reinterpret_cast<double*>(value));
@@ -321,8 +340,9 @@ class BoolVar : public BaseVar {
           void* v,
           checkfunptr ptr,
           preProcess preFun,
-          bool allowDynamicSet)
-    : BaseVar(name, v, ptr, preFun, allowDynamicSet),
+          bool allowDynamicSet,
+          VarType vt = VarType::TENDIS)
+    : BaseVar(name, v, ptr, preFun, allowDynamicSet, vt),
       _defaultValue(*reinterpret_cast<bool*>(value)) {}
   virtual std::string show() const {
     return *reinterpret_cast<bool*>(value) ? "yes" : "no";
@@ -374,6 +394,30 @@ class NoUseVar : public BaseVar {
   }
 };
 
+// RocksDB CF option variable - uses RocksDB default value, can be modified at runtime
+// Value is stored in _rocksdbCFOptions when set via config file or config set
+class RocksCFVar : public BaseVar {
+ public:
+  RocksCFVar(const std::string& name, bool allowDynamicSet)
+    : BaseVar(name, &_value, nullptr, nullptr, allowDynamicSet, VarType::ROCKS_CF) {}
+  virtual std::string show() const {
+    return _value;
+  }
+  virtual std::string default_show() const {
+    return "";
+  }
+  virtual bool need_show() const {
+    return !_value.empty();
+  }
+
+ private:
+  TSAN_SUPPRESSION Status set(const std::string& val, bool startup) {
+    _value = val;
+    return {ErrorCodes::ERR_OK, ""};
+  }
+  std::string _value;
+};
+
 class rewriteConfigState {
  public:
   rewriteConfigState() : _hasTail(false) {}
@@ -400,6 +444,7 @@ class rewriteConfigState {
 };
 
 typedef std::unordered_map<std::string, std::string> ParamsMap;
+
 class ServerParams {
  public:
   ServerParams();
@@ -410,9 +455,6 @@ class ServerParams {
   std::string showAll() const;
   bool showVar(const std::string& key, std::string* info) const;
   bool showVar(const std::string& key, std::vector<std::string>* info) const;
-  Status setRocksOption(const std::string& name, const std::string& value);
-  Status setRocksOptionDynamic(const std::string& argname,
-                               const std::string& value);
   Status setVar(const std::string& name,
                 const std::string& value,
                 bool startup = true);
@@ -423,6 +465,9 @@ class ServerParams {
   std::string getConfFile() const {
     return _confFile;
   }
+
+  // Legacy RocksDB option accessors (for backward compatibility)
+  // TODO: migrate to member variables
   const ParamsMap& getRocksdbOptions() const {
     return _rocksdbOptions;
   }
@@ -433,6 +478,7 @@ class ServerParams {
     }
     return &it->second;
   }
+
   BaseVar* serverParamsVar(const std::string& key) {
     return _mapServerParams[tendisplus::toLower(key)];
   }

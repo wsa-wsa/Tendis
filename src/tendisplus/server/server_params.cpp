@@ -25,7 +25,7 @@
 #include "rocksdb/tendis_extension.h"
 
 #include "tendisplus/server/server_entry.h"
-#include "tendisplus/storage/rocks/rocks_option_defs.h"
+#include "tendisplus/storage/kvstore.h"
 #include "tendisplus/utils/invariant.h"
 #include "tendisplus/utils/status.h"
 #include "tendisplus/utils/string.h"
@@ -36,63 +36,69 @@ std::shared_ptr<tendisplus::ServerParams> gParams;
 std::string gRenameCmdList = "";   // NOLINT(runtime/string)
 std::string gMappingCmdList = "";  // NOLINT(runtime/string)
 
-#define REGISTER_VARS_FULL(                                    \
-  str, var, checkfun, prefun, minval, maxval, allowDynamicSet) \
-  if (typeid(var) == typeid(int32_t) || /* NOLINT */           \
-      typeid(var) == typeid(uint32_t))  /* NOLINT */           \
-    _mapServerParams.insert(                                   \
-      make_pair(toLower(str),                                  \
-                new IntVar(str,                                \
-                           reinterpret_cast<void*>(&var),      \
-                           checkfun,                           \
-                           prefun,                             \
-                           minval,                             \
-                           maxval,                             \
-                           allowDynamicSet)));                 \
-  else if (typeid(var) == typeid(int64_t) || /* NOLINT */      \
-           typeid(var) == typeid(uint64_t))  /* NOLINT */      \
-    _mapServerParams.insert(                                   \
-      make_pair(toLower(str),                                  \
-                new Int64Var(str,                              \
-                             reinterpret_cast<void*>(&var),    \
-                             checkfun,                         \
-                             prefun,                           \
-                             minval,                           \
-                             maxval,                           \
-                             allowDynamicSet)));               \
-  else if (typeid(var) == typeid(float))                       \
-    _mapServerParams.insert(                                   \
-      make_pair(toLower(str),                                  \
-                new FloatVar(str,                              \
-                             reinterpret_cast<void*>(&var),    \
-                             checkfun,                         \
-                             prefun,                           \
-                             allowDynamicSet)));               \
-  else if (typeid(var) == typeid(double))                      \
-    _mapServerParams.insert(                                   \
-      make_pair(toLower(str),                                  \
-                new DoubleVar(str,                             \
-                              reinterpret_cast<void*>(&var),   \
-                              checkfun,                        \
-                              prefun,                          \
-                              allowDynamicSet)));              \
-  else if (typeid(var) == typeid(std::string))                 \
-    _mapServerParams.insert(                                   \
-      make_pair(toLower(str),                                  \
-                new StringVar(str,                             \
-                              reinterpret_cast<void*>(&var),   \
-                              checkfun,                        \
-                              prefun,                          \
-                              allowDynamicSet)));              \
-  else if (typeid(var) == typeid(bool))                        \
-    _mapServerParams.insert(                                   \
-      make_pair(toLower(str),                                  \
-                new BoolVar(str,                               \
-                            reinterpret_cast<void*>(&var),     \
-                            checkfun,                          \
-                            prefun,                            \
-                            allowDynamicSet)));                \
-  else                                                         \
+#define REGISTER_VARS_FULL(                                              \
+  str, var, checkfun, prefun, minval, maxval, allowDynamicSet, vartype)  \
+  if (typeid(var) == typeid(int32_t) || /* NOLINT */                     \
+      typeid(var) == typeid(uint32_t))  /* NOLINT */                     \
+    _mapServerParams.insert(                                             \
+      make_pair(toLower(str),                                            \
+                new IntVar(str,                                          \
+                           reinterpret_cast<void*>(&var),                \
+                           checkfun,                                     \
+                           prefun,                                       \
+                           minval,                                       \
+                           maxval,                                       \
+                           allowDynamicSet,                              \
+                           vartype)));                                   \
+  else if (typeid(var) == typeid(int64_t) || /* NOLINT */                \
+           typeid(var) == typeid(uint64_t))  /* NOLINT */                \
+    _mapServerParams.insert(                                             \
+      make_pair(toLower(str),                                            \
+                new Int64Var(str,                                        \
+                             reinterpret_cast<void*>(&var),              \
+                             checkfun,                                   \
+                             prefun,                                     \
+                             minval,                                     \
+                             maxval,                                     \
+                             allowDynamicSet,                            \
+                             vartype)));                                 \
+  else if (typeid(var) == typeid(float))                                 \
+    _mapServerParams.insert(                                             \
+      make_pair(toLower(str),                                            \
+                new FloatVar(str,                                        \
+                             reinterpret_cast<void*>(&var),              \
+                             checkfun,                                   \
+                             prefun,                                     \
+                             allowDynamicSet,                            \
+                             vartype)));                                 \
+  else if (typeid(var) == typeid(double))                                \
+    _mapServerParams.insert(                                             \
+      make_pair(toLower(str),                                            \
+                new DoubleVar(str,                                       \
+                              reinterpret_cast<void*>(&var),             \
+                              checkfun,                                  \
+                              prefun,                                    \
+                              allowDynamicSet,                           \
+                              vartype)));                                \
+  else if (typeid(var) == typeid(std::string))                           \
+    _mapServerParams.insert(                                             \
+      make_pair(toLower(str),                                            \
+                new StringVar(str,                                       \
+                              reinterpret_cast<void*>(&var),             \
+                              checkfun,                                  \
+                              prefun,                                    \
+                              allowDynamicSet,                           \
+                              vartype)));                                \
+  else if (typeid(var) == typeid(bool))                                  \
+    _mapServerParams.insert(                                             \
+      make_pair(toLower(str),                                            \
+                new BoolVar(str,                                         \
+                            reinterpret_cast<void*>(&var),               \
+                            checkfun,                                    \
+                            prefun,                                      \
+                            allowDynamicSet,                             \
+                            vartype)));                                  \
+  else                                                                   \
     INVARIANT(0);  // NOTE(takenliu): if other type is needed, change here.
 
 static const char* NO_USE_VALUE = "NO_USE";
@@ -102,17 +108,25 @@ static const char* NO_USE_VALUE = "NO_USE";
     new NoUseVar(str, const_cast<char*>(NO_USE_VALUE), NULL, NULL, false)));
 
 #define REGISTER_VARS(var) \
-  REGISTER_VARS_FULL(#var, var, NULL, NULL, 0, INT_MAX, false)
+  REGISTER_VARS_FULL(#var, var, NULL, NULL, 0, INT_MAX, false, VarType::TENDIS)
 #define REGISTER_VARS_DIFF_NAME(str, var) \
-  REGISTER_VARS_FULL(str, var, NULL, NULL, 0, INT_MAX, false)
+  REGISTER_VARS_FULL(str, var, NULL, NULL, 0, INT_MAX, false, VarType::TENDIS)
 #define REGISTER_VARS_ALLOW_DYNAMIC_SET(var) \
-  REGISTER_VARS_FULL(#var, var, NULL, NULL, 0, INT_MAX, true)
+  REGISTER_VARS_FULL(#var, var, NULL, NULL, 0, INT_MAX, true, VarType::TENDIS)
 #define REGISTER_VARS_DIFF_NAME_DYNAMIC(str, var) \
-  REGISTER_VARS_FULL(str, var, NULL, NULL, 0, INT_MAX, true)
+  REGISTER_VARS_FULL(str, var, NULL, NULL, 0, INT_MAX, true, VarType::TENDIS)
 #define REGISTER_VARS_SAME_NAME(                          \
   var, checkfun, prefun, minval, maxval, allowDynamicSet) \
   REGISTER_VARS_FULL(                                     \
-    #var, var, checkfun, prefun, minval, maxval, allowDynamicSet)
+    #var, var, checkfun, prefun, minval, maxval, allowDynamicSet, VarType::TENDIS)
+
+// RocksDB option registration macros
+#define REGISTER_ROCKS_DB_OPTION(str, var, allowDynamicSet) \
+  REGISTER_VARS_FULL(str, var, NULL, NULL, 0, INT_MAX, allowDynamicSet, VarType::ROCKS_DB)
+
+// Register CF option - uses RocksDB default value, can be modified at runtime
+#define REGISTER_ROCKS_CF_OPTION(str, allowDynamicSet) \
+  _mapServerParams.insert(make_pair(toLower(str), new RocksCFVar(str, allowDynamicSet)))
 
 bool logLevelParamCheck(const std::string& val,
                         bool startup,
@@ -327,7 +341,7 @@ Status rewriteConfigState::rewriteConfigOverwriteFile(
 ServerParams::ServerParams() {
   REGISTER_VARS_DIFF_NAME("bind", bindIp);
   REGISTER_VARS_DIFF_NAME("bind2", bindIp2);
-  REGISTER_VARS_FULL("port", port, nullptr, nullptr, 1, 65535, false);
+  REGISTER_VARS_FULL("port", port, nullptr, nullptr, 1, 65535, false, VarType::TENDIS);
   REGISTER_VARS_DIFF_NAME("tcp-backlog", tcpBacklog);
   REGISTER_VARS_FULL("logLevel",
                      logLevel,
@@ -335,7 +349,8 @@ ServerParams::ServerParams() {
                      removeQuotesAndToLower,
                      -1,
                      -1,
-                     false);
+                     false,
+                     VarType::TENDIS);
   REGISTER_VARS(logDir);
   REGISTER_VARS(logSizeMb);
   REGISTER_VARS(daemon);
@@ -426,7 +441,8 @@ ServerParams::ServerParams() {
                      NULL,
                      10,
                      5000,
-                     true);
+                     true,
+                     VarType::TENDIS);
   REGISTER_VARS_SAME_NAME(
     truncateBinlogNum, nullptr, nullptr, 1, INT_MAX, true);
   REGISTER_VARS_ALLOW_DYNAMIC_SET(binlogFileSizeMB);
@@ -455,7 +471,8 @@ ServerParams::ServerParams() {
                      nullptr,
                      -1,
                      19,
-                     false);
+                     false,
+                     VarType::TENDIS);
   REGISTER_VARS_DIFF_NAME("rocks.blockcache_strict_capacity_limit",
                           rocksStrictCapacityLimit);
   REGISTER_VARS_DIFF_NAME("rocks.rowcachemb", rocksRowcacheMB);
@@ -468,7 +485,8 @@ ServerParams::ServerParams() {
                      nullptr,
                      -1,
                      19,
-                     false);
+                     false,
+                     VarType::TENDIS);
 
   REGISTER_VARS_DIFF_NAME("rocks.rate_limiter_rate_bytes_per_sec",
                           rocksRateLimiterRateBytesPerSec);
@@ -493,7 +511,8 @@ ServerParams::ServerParams() {
                      removeQuotesAndToLower,
                      -1,
                      -1,
-                     false);
+                     false,
+                     VarType::TENDIS);
   REGISTER_VARS_DIFF_NAME("rocks.level0_compress_enabled", level0Compress);
   REGISTER_VARS_DIFF_NAME("rocks.level1_compress_enabled", level1Compress);
 
@@ -508,6 +527,19 @@ ServerParams::ServerParams() {
   REGISTER_VARS_DIFF_NAME("rocks.delete_bytes_per_second",
                           rocksDeleteBytesPerSecond);
 
+  // RocksDB CF-level blob options (apply to all CFs)
+  // Only register option names, values are set via setVar
+  REGISTER_ROCKS_CF_OPTION("rocks.enable_blob_files", true);
+  REGISTER_ROCKS_CF_OPTION("rocks.min_blob_size", true);
+  REGISTER_ROCKS_CF_OPTION("rocks.blob_file_size", true);
+  REGISTER_ROCKS_CF_OPTION("rocks.blob_compression_type", true);
+  REGISTER_ROCKS_CF_OPTION("rocks.enable_blob_garbage_collection", true);
+  REGISTER_ROCKS_CF_OPTION("rocks.blob_garbage_collection_age_cutoff", true);
+  REGISTER_ROCKS_CF_OPTION("rocks.blob_garbage_collection_force_threshold", true);
+  REGISTER_ROCKS_CF_OPTION("rocks.blob_compaction_readahead_size", true);
+  REGISTER_ROCKS_CF_OPTION("rocks.blob_file_starting_level", true);
+  REGISTER_ROCKS_CF_OPTION("rocks.prepopulate_blob_cache", true);
+
   REGISTER_VARS_DIFF_NAME_DYNAMIC("bgcompact-enabled", bgcompactEnabled);
   REGISTER_VARS_FULL("bgcompact-interval",
                      bgcompactInterval,
@@ -515,18 +547,20 @@ ServerParams::ServerParams() {
                      nullptr,
                      10,
                      UINT_MAX,
-                     true);
+                     true,
+                     VarType::TENDIS);
   REGISTER_VARS_FULL(
-    "bgcompact-begin", bgcompactBegin, nullptr, nullptr, 0, 23, true);
+    "bgcompact-begin", bgcompactBegin, nullptr, nullptr, 0, 23, true, VarType::TENDIS);
   REGISTER_VARS_FULL(
-    "bgcompact-end", bgcompactEnd, nullptr, nullptr, 0, 23, true);
+    "bgcompact-end", bgcompactEnd, nullptr, nullptr, 0, 23, true, VarType::TENDIS);
   REGISTER_VARS_FULL("bgcompact-force-delete-percentage",
                      bgcompactForceDeletePercentage,
                      nullptr,
                      nullptr,
                      1,
                      100,
-                     true);
+                     true,
+                     VarType::TENDIS);
 
   REGISTER_VARS_SAME_NAME(
     migrateSenderThreadnum, nullptr, nullptr, 1, 200, true);
@@ -537,7 +571,7 @@ ServerParams::ServerParams() {
   REGISTER_VARS_DIFF_NAME("cluster-enabled", clusterEnabled);
   REGISTER_VARS_DIFF_NAME("domain-enabled", domainEnabled);
   REGISTER_VARS_FULL(
-    "aof-enabled", aofEnabled, aofEnabledCheck, nullptr, 0, INT_MAX, true);
+    "aof-enabled", aofEnabled, aofEnabledCheck, nullptr, 0, INT_MAX, true, VarType::TENDIS);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("aof-psync-num", aofPsyncNum);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("fullPsync-notice-enabled",
                                   fullPsyncNoticeEnable);
@@ -758,92 +792,118 @@ Status ServerParams::checkParams() {
   return {ErrorCodes::ERR_OK, ""};
 }
 
-Status ServerParams::setRocksOption(const std::string& argname,
-                                    const std::string& value) {
-  // Parse option using centralized definitions
-  auto parsed = RocksOptionDefs::parseOption(argname);
-
-  if (!parsed.isValid()) {
-    // Fallback: check if it's a valid format but unknown option
-    if (!RocksOptionDefs::hasRocksPrefix(argname)) {
-      return {ErrorCodes::ERR_PARSEOPT, "not found arg:" + argname};
-    }
-    // Unknown option - store as DB option for backward compatibility
-    std::string optName = argname.substr(RocksOptionDefs::kRocksPrefixLen);
-    LOG(WARNING) << "Unknown RocksDB option: " << argname
-                 << ", storing as DB-level option";
-    _rocksdbOptions[toLower(optName)] = value;
-    return {ErrorCodes::ERR_OK, ""};
-  }
-
-  std::string optionName = toLower(parsed.name);
-
-  // Store based on option scope
-  if (parsed.isCFOption()) {
-    std::string cfName = parsed.getCFName();
-    if (cfName.empty()) {
-      // Apply to all CFs
-      for (const auto& cf : RocksOptionDefs::getAllCFNames()) {
-        _rocksdbCFOptions[cf][optionName] = value;
-      }
-    } else {
-      // Apply to specific CF
-      _rocksdbCFOptions[cfName][optionName] = value;
-    }
-  } else {
-    // DB-level option (or unknown)
-    _rocksdbOptions[optionName] = value;
-  }
-
-  return {ErrorCodes::ERR_OK, ""};
-}
-
-Status ServerParams::setRocksOptionDynamic(const std::string& argname,
-                                           const std::string& value) {
-  auto server = getGlobalServer();
-  LocalSessionGuard sg(server.get());
-  for (uint64_t i = 0; i < server->getKVStoreCount(); i++) {
-    auto expStore = server->getSegmentMgr()->getDb(
-      sg.getSession(), i, mgl::LockMode::LOCK_IS);
-    RET_IF_ERR_EXPECTED(expStore);
-
-    Status s;
-    // change rocksdb options dynamically
-    s = expStore.value().store->setOptionDynamic(argname, value);
-    RET_IF_ERR(s);
-  }
-  return {ErrorCodes::ERR_OK, ""};
-}
 Status ServerParams::setVar(const std::string& name,
                             const std::string& value,
                             bool startup) {
-  std::string errinfo;
   auto argname = toLower(name);
-  auto iter = _mapServerParams.find(toLower(name));
 
-  if (startup) {
-    // load serverparam and rocksoptions when startup
-    if (iter == _mapServerParams.end()) {
-      return setRocksOption(argname, value);
+  // Parse rocks.xxx or rocks.defaultcf.xxx / rocks.binlogcf.xxx
+  std::string optName;
+  std::string targetCf;  // "" means all CFs, "defaultcf" or "binlogcf" for specific
+  std::string baseOptName = argname;  // for lookup in _mapServerParams
+
+  if (argname.compare(0, 6, "rocks.") == 0) {
+    std::string rest = argname.substr(6);
+    if (rest.compare(0, 10, "defaultcf.") == 0) {
+      optName = rest.substr(10);
+      targetCf = "defaultcf";
+      baseOptName = "rocks." + optName;  // lookup base option
+    } else if (rest.compare(0, 9, "binlogcf.") == 0) {
+      optName = rest.substr(9);
+      targetCf = "binlogcf";
+      baseOptName = "rocks." + optName;  // lookup base option
     } else {
-      return iter->second->setVar(value, startup);
-    }
-  } else {
-    // change serverparam and rocksoptions when running
-    LOG(INFO) << "ServerParams setVar dynamic, " << argname << ": " << value;
-    if (iter == _mapServerParams.end()) {
-      if (RocksOptionDefs::hasRocksPrefix(argname)) {
-        Status s = setRocksOptionDynamic(argname, value);
-        RET_IF_ERR(s);
-        return setRocksOption(argname, value);
-      }
-    } else {
-      return iter->second->setVar(value, startup);
+      optName = rest;
+      targetCf = "";
     }
   }
 
-  errinfo = "not found arg:" + argname;
-  return {ErrorCodes::ERR_PARSEOPT, errinfo};
+  // Find the registered parameter
+  auto iter = _mapServerParams.find(baseOptName);
+  if (iter == _mapServerParams.end()) {
+    return {ErrorCodes::ERR_PARSEOPT, "not found arg:" + argname};
+  }
+
+  VarType vt = iter->second->getVarType();
+
+  // Handle ROCKS_CF option
+  if (vt == VarType::ROCKS_CF) {
+    if (!startup && !iter->second->isallowDynamicSet()) {
+      return {ErrorCodes::ERR_PARSEOPT, argname + " can't change dynamically"};
+    }
+
+    LOG(INFO) << "ServerParams setVar CF option, " << argname << ": " << value
+              << (startup ? " (startup)" : " (dynamic)");
+
+    ColumnFamilyNumber cfTarget = ColumnFamilyNumber::ColumnFamily_All;
+    if (targetCf.empty()) {
+      cfTarget = ColumnFamilyNumber::ColumnFamily_All;
+    } else if (targetCf == "defaultcf") {
+      cfTarget = ColumnFamilyNumber::ColumnFamily_Default;
+    } else if (targetCf == "binlogcf") {
+      cfTarget = ColumnFamilyNumber::ColumnFamily_Binlog;
+    }
+
+    // Store the value for later use (e.g., when creating new KVStore)
+    if (targetCf.empty()) {
+      _rocksdbCFOptions["defaultcf"][optName] = value;
+      _rocksdbCFOptions["binlogcf"][optName] = value;
+    } else {
+      _rocksdbCFOptions[targetCf][optName] = value;
+    }
+
+    // Apply dynamically if not startup (RocksDB is already running)
+    if (!startup) {
+      auto server = getGlobalServer();
+      if (server) {
+        LocalSessionGuard sg(server.get());
+        for (uint64_t i = 0; i < server->getKVStoreCount(); i++) {
+          auto expStore = server->getSegmentMgr()->getDb(
+            sg.getSession(), i, mgl::LockMode::LOCK_IS);
+          RET_IF_ERR_EXPECTED(expStore);
+          Status st = expStore.value().store->setOptionDynamic(
+              optName, value, true, cfTarget);
+          RET_IF_ERR(st);
+        }
+      }
+    }
+    return {ErrorCodes::ERR_OK, ""};
+  }
+
+  // Not a CF option, handle normal params
+  if (!startup) {
+    LOG(INFO) << "ServerParams setVar dynamic, " << argname << ": " << value;
+  }
+
+  auto s = iter->second->setVar(value, startup);
+  if (!s.ok()) {
+    return s;
+  }
+
+  if (vt == VarType::TENDIS) {
+    return {ErrorCodes::ERR_OK, ""};
+  }
+
+  // Handle ROCKS_DB option
+  if (vt == VarType::ROCKS_DB) {
+    _rocksdbOptions[optName] = value;
+    if (!startup) {
+      auto server = getGlobalServer();
+      if (server) {
+        LocalSessionGuard sg(server.get());
+        for (uint64_t i = 0; i < server->getKVStoreCount(); i++) {
+          auto expStore = server->getSegmentMgr()->getDb(
+            sg.getSession(), i, mgl::LockMode::LOCK_IS);
+          RET_IF_ERR_EXPECTED(expStore);
+          Status st = expStore.value().store->setOptionDynamic(
+              optName, value, false, ColumnFamilyNumber::ColumnFamily_All);
+          RET_IF_ERR(st);
+        }
+      }
+    }
+  }
+
+  return {ErrorCodes::ERR_OK, ""};
 }
 
 bool ServerParams::registerOnupdate(const std::string& name, funptr ptr) {
@@ -865,16 +925,6 @@ std::string ServerParams::showAll() const {
     }
     if (iter.second->need_show()) {
       ret += "  " + iter.second->getName() + ":" + iter.second->show() + "\n";
-    }
-  }
-
-  for (const auto& iter : _rocksdbOptions) {
-    ret += "  rocks." + iter.first + ":" + iter.second + "\n";
-  }
-
-  for (const auto& cf : _rocksdbCFOptions) {
-    for (const auto& iter : cf.second) {
-      ret += "  rocks." + cf.first + "." + iter.first + ":" + iter.second + "\n";
     }
   }
 
@@ -906,36 +956,7 @@ bool ServerParams::showVar(const std::string& key,
     }
   }
 
-  // DB-level options
-  for (const auto& iter : _rocksdbOptions) {
-    std::string param = "rocks." + iter.first;
-    if (redis_port::stringmatchlen(
-          key.c_str(), key.size(), param.c_str(), param.size(), 1)) {
-      info->push_back(param);
-      info->push_back(iter.second);
-    }
-  }
-
-  // CF-level options: match both "rocks.cfname.option" and "rocks.option"
-  for (const auto& cf : _rocksdbCFOptions) {
-    for (const auto& iter : cf.second) {
-      std::string cfParam = "rocks." + cf.first + "." + iter.first;
-      std::string shortParam = "rocks." + iter.first;
-
-      bool matchCf = redis_port::stringmatchlen(
-        key.c_str(), key.size(), cfParam.c_str(), cfParam.size(), 1);
-      bool matchShort = redis_port::stringmatchlen(
-        key.c_str(), key.size(), shortParam.c_str(), shortParam.size(), 1);
-
-      if (matchCf || matchShort) {
-        info->push_back(cfParam);
-        info->push_back(iter.second);
-      }
-    }
-  }
-
   return !info->empty();
-}
 }
 
 Status ServerParams::rewriteConfig() const {

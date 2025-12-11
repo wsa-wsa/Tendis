@@ -39,7 +39,6 @@
 #include "tendisplus/server/server_entry.h"
 #include "tendisplus/server/session.h"
 #include "tendisplus/storage/rocks/rocks_kvttlcompactfilter.h"
-#include "tendisplus/storage/rocks/rocks_option_defs.h"
 #include "tendisplus/storage/varint.h"
 #include "tendisplus/utils/invariant.h"
 #include "tendisplus/utils/scopeguard.h"
@@ -3225,42 +3224,24 @@ Status RocksKVStore::recoveryFromBgError() {
   return {ErrorCodes::ERR_OK, ""};
 }
 
-Status RocksKVStore::setOptionDynamic(const std::string& option,
-                                      const std::string& value) {
-  // Parse option using centralized definitions
-  auto parsed = RocksOptionDefs::parseOption(option);
-  if (!parsed.isValid()) {
-    return {ErrorCodes::ERR_INTERNAL,
-            option + " is not a valid rocksdb option"};
-  }
-
-  const std::string& optionName = parsed.name;
-
-  // Validate option can be changed dynamically
-  auto desc = RocksOptionDefs::getOptionDescriptor(optionName);
-  if (desc == nullptr) {
-    LOG(WARNING) << "Unknown RocksDB option: " << optionName
-                 << ", attempting to apply anyway";
-  } else if (desc->mutability != RocksOptionMutability::DYNAMIC) {
-    return {ErrorCodes::ERR_INTERNAL,
-            option + " is a static option and can't be changed at runtime"};
-  }
-
+Status RocksKVStore::setOptionDynamic(const std::string& optionName,
+                                      const std::string& value,
+                                      bool isCFOption,
+                                      ColumnFamilyNumber cfTarget) {
   // Prepare the option value (handle special cases)
   std::unordered_map<std::string, std::string> optionMap;
   optionMap[optionName] = (optionName == "blob_compression_type")
                             ? rocksGetCompressionTypeStr(value)
                             : value;
 
-  // Apply based on option scope
-  if (parsed.isDBOption() || parsed.isUnknown()) {
-    // DB-level option (or unknown - treat as DB for backward compatibility)
+  if (!isCFOption) {
+    // DB-level option
     auto s = getBaseDB()->SetDBOptions(optionMap);
     if (!s.ok()) {
       return {ErrorCodes::ERR_INTERNAL, s.ToString()};
     }
-  } else if (parsed.isCFOption()) {
-    // CF-level option: apply based on ColumnFamilyTarget
+  } else {
+    // CF-level option
     auto applyCF = [&](ColumnFamilyNumber cfNum) -> Status {
       auto s = getBaseDB()->SetOptions(getColumnFamilyHandle(cfNum), optionMap);
       if (!s.ok()) {
@@ -3269,21 +3250,18 @@ Status RocksKVStore::setOptionDynamic(const std::string& option,
       return {ErrorCodes::ERR_OK, ""};
     };
 
-    switch (parsed.cfTarget) {
-      case ColumnFamilyTarget::ALL:
+    switch (cfTarget) {
+      case ColumnFamilyNumber::ColumnFamily_All:
         RET_IF_ERR(applyCF(ColumnFamilyNumber::ColumnFamily_Default));
         RET_IF_ERR(applyCF(ColumnFamilyNumber::ColumnFamily_Binlog));
         break;
-      case ColumnFamilyTarget::DEFAULT:
+      case ColumnFamilyNumber::ColumnFamily_Default:
         RET_IF_ERR(applyCF(ColumnFamilyNumber::ColumnFamily_Default));
         break;
-      case ColumnFamilyTarget::BINLOG:
+      case ColumnFamilyNumber::ColumnFamily_Binlog:
         RET_IF_ERR(applyCF(ColumnFamilyNumber::ColumnFamily_Binlog));
         break;
     }
-  } else {
-    return {ErrorCodes::ERR_INTERNAL,
-            "Cannot determine scope for option: " + optionName};
   }
 
   return {ErrorCodes::ERR_OK, ""};

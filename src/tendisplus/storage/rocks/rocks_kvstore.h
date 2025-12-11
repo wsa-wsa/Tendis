@@ -412,8 +412,11 @@ class RocksKVStore : public KVStore {
   std::string getBgError() const override;
   Status recoveryFromBgError() override;
   void resetStatistics() override;
-  Status setOptionDynamic(const std::string& option,
-                          const std::string& value) override;
+  // Set RocksDB option dynamically with pre-parsed scope info
+  Status setOptionDynamic(const std::string& optionName,
+                          const std::string& value,
+                          bool isCFOption,
+                          ColumnFamilyNumber cfTarget) override;
   Status setCompactOnDeletionCollectorFactory(
     const std::string& option,
     std::shared_ptr<tendisplus::ServerParams> cfg) override;
