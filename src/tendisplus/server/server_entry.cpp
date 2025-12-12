@@ -18,7 +18,16 @@
 
 #ifndef _WIN32
 #ifdef TENDIS_JEMALLOC
+// Handle Clang's posix_memalign throw() conflict on Linux with glibc
+#if defined(__clang__) && defined(__GLIBC__)
+#include <mm_malloc.h>
+#endif
 #include "jemalloc/jemalloc.h"
+// macOS jemalloc uses je_ prefix, Linux does not
+#ifdef __APPLE__
+#define mallctl je_mallctl
+#define malloc_stats_print je_malloc_stats_print
+#endif
 #endif
 #endif
 
@@ -115,7 +124,7 @@ std::list<SlowlogEntry> SlowlogStat::getSlowlogData(uint64_t count) {
   std::lock_guard<std::mutex> lk(_dataMutex);
   std::list<SlowlogEntry> result;
   int size;
-  size = std::min(count, _slowlogData.size());
+  size = std::min(static_cast<size_t>(count), _slowlogData.size());
   std::list<SlowlogEntry>::iterator it = _slowlogData.begin();
   for (int i = 0; i < size; i++) {
     result.push_back(*it);
@@ -900,12 +909,20 @@ Status ServerEntry::startup(const std::shared_ptr<ServerParams>& cfg) {
 
   // server stats monitor
   _cronThd = std::make_unique<std::thread>([this] {
+#ifdef __APPLE__
+    INVARIANT(!pthread_setname_np("tx-svr-cron"));
+#else
     INVARIANT(!pthread_setname_np(pthread_self(), "tx-svr-cron"));
+#endif
     serverCron();
   });
 
   _bgcompactThd = std::make_unique<std::thread>([this] {
+#ifdef __APPLE__
+    INVARIANT(!pthread_setname_np("tx-bgcom-cron"));
+#else
     INVARIANT(!pthread_setname_np(pthread_self(), "tx-bgcom-cron"));
+#endif
     bgCompactCron();
   });
 
@@ -2124,7 +2141,7 @@ void ServerEntry::serverCron() {
 }
 
 void ServerEntry::jeprofCron() {
-#ifndef _WIN32
+#ifdef __linux__
 #ifdef TENDIS_JEMALLOC
   size_t rss_human_size = 0;
   std::ifstream file;
@@ -2155,8 +2172,8 @@ void ServerEntry::jeprofCron() {
 
     mallctl("prof.dump", NULL, NULL, NULL, 0);
   }
-#endif  // !TENDIS_JEMALLOC
-#endif  // !_WIN32
+#endif  // TENDIS_JEMALLOC
+#endif  // __linux__
 }
 
 void ServerEntry::jemallocBgThreadConf() {

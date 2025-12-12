@@ -4,6 +4,7 @@
 
 #include "tendisplus/network/latency_record.h"
 
+#include <cinttypes>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -29,8 +30,8 @@ std::string LockLatencyRecord::toString() const {
   char temp[256];
   auto r = snprintf(temp,
                     256,
-                    " TotalTimeUsedAcquireLock(us):%lu AcquireLockCount:%lu "
-                    "LongestTimeAcquireLock(us):%lu Associated id:%s",
+                    " TotalTimeUsedAcquireLock(us):%" PRIu64 " AcquireLockCount:%" PRIu64 " "
+                    "LongestTimeAcquireLock(us):%" PRIu64 " Associated id:%s",
                     _totalTimeAcquireLock,
                     _countAcquireLock,
                     _maxTimeAcquireLock,
@@ -74,8 +75,8 @@ std::string RocksdbLatencyRecord::toString() const {
   auto r =
     snprintf(temp,
              256,
-             " TotalTimeUsed(us):%lu LongestTime(us):%lu TotalSize(byte):%lu "
-             "Count:%lu Succ:%lu Fail:%lu",
+             " TotalTimeUsed(us):%" PRIu64 " LongestTime(us):%" PRIu64 " TotalSize(byte):%" PRIu64 " "
+             "Count:%" PRIu64 " Succ:%" PRIu64 " Fail:%" PRIu64,
              _totalTimeRocksdb,
              _maxTimeRocksdb,
              _totalSizeRocksdb,

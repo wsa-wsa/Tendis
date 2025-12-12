@@ -94,7 +94,11 @@ Status IndexManager::startup() {
 
   _isRunning.store(true, std::memory_order_relaxed);
   _runner = std::thread([this]() {
+#ifdef __APPLE__
+    pthread_setname_np("tx-idx-loop");
+#else
     pthread_setname_np(pthread_self(), "tx-idx-loop");
+#endif
     run();
   });
 

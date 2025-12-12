@@ -354,7 +354,11 @@ Status NetworkAsio::startAcceptThread(
   acceptThd = std::make_shared<std::thread>([this, &acceptCtx] {
     std::string threadName = _name + "-accept";
     threadName.resize(15);
+#ifdef __APPLE__
+    INVARIANT(!pthread_setname_np(threadName.c_str()));
+#else
     INVARIANT(!pthread_setname_np(pthread_self(), threadName.c_str()));
+#endif
     while (_isRunning.load(std::memory_order_relaxed)) {
       // if no work-gurad, the run() returns immediately if no other tasks
       asio::io_context::work work(*acceptCtx);
@@ -384,7 +388,11 @@ Status NetworkAsio::startThread() {
     std::thread thd([this, i] {
       std::string threadName = _name + "-rw-" + std::to_string(i);
       threadName.resize(15);
+#ifdef __APPLE__
+      INVARIANT_D(!pthread_setname_np(threadName.c_str()));
+#else
       INVARIANT_D(!pthread_setname_np(pthread_self(), threadName.c_str()));
+#endif
       LOG(INFO) << "add netIoThread, i:" << i
                 << ", threadId:" << getCurThreadId();
       while (_isRunning.load(std::memory_order_relaxed)) {

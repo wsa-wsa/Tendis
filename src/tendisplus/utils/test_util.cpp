@@ -3200,12 +3200,6 @@ void testSync(std::shared_ptr<ServerEntry> svr) {
 }
 
 void testTbitmap(std::shared_ptr<ServerEntry> svr) {
-  auto fmtSyncVerRes = [](std::stringstream& ss, uint64_t ts, uint64_t ver) {
-    ss.str("");
-    Command::fmtMultiBulkLen(ss, 2);
-    Command::fmtLongLong(ss, ts);
-    Command::fmtLongLong(ss, ver);
-  };
 
   asio::io_context ioCtx;
   asio::ip::tcp::socket socket(ioCtx), socket1(ioCtx);

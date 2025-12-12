@@ -26,12 +26,21 @@
 
 #ifndef WIN32
 #ifdef TENDIS_JEMALLOC
+#ifndef __APPLE__
 #include <malloc.h>
-
+#endif
+// Handle Clang's posix_memalign throw() conflict on Linux with glibc
+#if defined(__clang__) && defined(__GLIBC__)
+#include <mm_malloc.h>
+#endif
 #include "jemalloc/jemalloc.h"
+// macOS jemalloc uses je_ prefix, Linux does not
+#ifdef __APPLE__
+#define mallctl je_mallctl
+#define malloc_stats_print je_malloc_stats_print
+#endif
 #endif  // !TENDIS_JEMALLOC
 #endif  // !WIN32
-#include "port/jemalloc_helper.h"
 #include "rapidjson/document.h"
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/stringbuffer.h"
@@ -3969,7 +3978,7 @@ class slowlogCommand : public Command {
       }
       auto slow_log_list = slowlog_stats.getSlowlogData(count_num);
       std::list<SlowlogEntry>::iterator it = slow_log_list.begin();
-      Command::fmtMultiBulkLen(ss, std::min(slow_log_list.size(), count_num));
+      Command::fmtMultiBulkLen(ss, std::min(slow_log_list.size(), static_cast<size_t>(count_num)));
       while (count_num > 0 && it != slow_log_list.end()) {
         SlowlogEntry slow_log_node = *it;
         Command::fmtMultiBulkLen(ss, 6);
@@ -5340,11 +5349,16 @@ class JeprofCommand : public Command {
       }
       LOG(INFO) << "Purged arenas success, narenas:" << narenas;
     } else if (action == "trim") {
+#ifdef __APPLE__
+      // macOS does not support malloc_trim, use jemalloc arena purge instead
+      return {ErrorCodes::ERR_UNKNOWN, "malloc_trim not supported on macOS, use arena.purge instead"};
+#else
       int ret = malloc_trim(0);
       if (ret != 0) {
         const char* err_msg = strerror(errno);
         return {ErrorCodes::ERR_UNKNOWN, std::string(err_msg, strlen(err_msg))};
       }
+#endif
     } else if (action == "stats") {
       return getUsage();
     } else {

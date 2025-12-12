@@ -115,8 +115,11 @@ struct redisCommand {
   int64_t microseconds, calls;
 };
 
+// macOS already defines htonll/ntohll as macros in system headers, no need to declare
+#if !defined(__APPLE__)
 uint64_t htonll(uint64_t v);
 uint64_t ntohll(uint64_t v);
+#endif
 uint64_t crc64(uint64_t crc, const unsigned char* s, uint64_t l);
 int random();
 
