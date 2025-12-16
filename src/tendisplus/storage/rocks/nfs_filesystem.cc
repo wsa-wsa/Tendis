@@ -11,32 +11,32 @@
 #include "logging/env_logger.h"  // for EnvLogger
 
 namespace {
-// 将相对路径转换为绝对路径
+// Convert relative path to absolute path
 std::string ToAbsolutePath(const std::string& path) {
   if (path.empty()) {
     return path;
   }
-  // 已经是绝对路径
+  // Already an absolute path
   if (path[0] == '/') {
     return path;
   }
-  // 相对路径，转换为绝对路径
+  // Relative path, convert to absolute path
   char cwd[PATH_MAX];
   if (getcwd(cwd, sizeof(cwd)) != nullptr) {
     std::string abs_path = std::string(cwd) + "/" + path;
-    // 规范化路径：处理 ./ 和 ../
-    // 简单处理：移除 ./
+    // Normalize path: handle ./ and ../
+    // Simple handling: remove ./
     size_t pos;
     while ((pos = abs_path.find("/./")) != std::string::npos) {
       abs_path.erase(pos, 2);
     }
-    // 处理开头的 ./
+    // Handle leading ./
     if (abs_path.find("./") == 0) {
       abs_path = abs_path.substr(2);
     }
     return abs_path;
   }
-  return path;  // 获取cwd失败，返回原路径
+  return path;  // Failed to get cwd, return original path
 }
 }  // anonymous namespace
 
@@ -298,7 +298,7 @@ NFSFileSystem::NFSFileSystem(const std::string& nfs_url,
                              const std::shared_ptr<FileSystem>& base)
   : FileSystemWrapper(base), 
     nfs_url_(nfs_url), 
-    local_prefix_(ToAbsolutePath(local_prefix)),  // 转换为绝对路径
+    local_prefix_(ToAbsolutePath(local_prefix)),  // Convert to absolute path
     nfs_ctx_(nullptr) {
   // Ensure that the local_prefix does not end in '/' for easy subsequent processing
   if (!local_prefix_.empty() && local_prefix_.back() == '/') {
@@ -363,19 +363,36 @@ void NFSFileSystem::InitNFSContext() {
   nfs_destroy_url(url);
 }
 
+bool NFSFileSystem::IsDataFile(const std::string& path) const {
+  // Check if the file is a data file (.sst, .blob, .ldb)
+  size_t len = path.length();
+  if (len > 4 && path.substr(len - 4) == ".sst") return true;
+  if (len > 5 && path.substr(len - 5) == ".blob") return true;
+  if (len > 4 && path.substr(len - 4) == ".ldb") return true;
+  return false;
+}
+
 bool NFSFileSystem::IsNFSPath(const std::string& path) const {
-  // Check if the path should be accessed via NFS
+  // ALL files go to NFS to ensure consistency between local Tendis and remote workers.
+  // Both local Tendis and remote compaction workers access the same files via NFS.
+  // This avoids any inconsistency issues between local SSD and shared storage.
+  //
+  // The path is considered NFS if:
+  // 1. Path matches local_prefix_ (the DB directory)
+  // 2. Path starts with /nfs/ or nfs://
+  // 3. Path is a relative path (assumed to be within DB directory)
+  
   bool is_nfs = false;
   std::string reason;
   
-  // 首先将输入路径也转换为绝对路径进行比较
+  // First convert input path to absolute path for comparison
   std::string abs_path = path;
   if (!path.empty() && path[0] != '/') {
-    // 相对路径，转换为绝对路径
+    // Relative path - assume it's within the DB directory, so it goes to NFS
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) != nullptr) {
       abs_path = std::string(cwd) + "/" + path;
-      // 规范化路径：移除 ./
+      // Normalize path: remove ./
       size_t pos;
       while ((pos = abs_path.find("/./")) != std::string::npos) {
         abs_path.erase(pos, 2);
@@ -383,9 +400,10 @@ bool NFSFileSystem::IsNFSPath(const std::string& path) const {
     }
   }
   
+  // Check if path matches local_prefix_ (ALL files under local_prefix_ go to NFS)
   if (!local_prefix_.empty() && abs_path.find(local_prefix_) == 0) {
     is_nfs = true;
-    reason = "matches local_prefix (after abs conversion)";
+    reason = "matches local_prefix (all files go to NFS)";
   } else if (path.find("/nfs/") == 0) {
     is_nfs = true;
     reason = "starts with /nfs/";
@@ -404,19 +422,19 @@ bool NFSFileSystem::IsNFSPath(const std::string& path) const {
 }
 
 std::string NFSFileSystem::ConvertToNFSPath(const std::string& path) const {
-  // 将本地路径转换为NFS相对路径
+  // Convert local path to NFS relative path
   // 
-  // 映射关系：local_prefix -> nfs_url (已在InitNFSContext中mount)
-  // 所以只需要提取相对路径部分
+  // Mapping: local_prefix -> nfs_url (already mounted in InitNFSContext)
+  // So we just need to extract the relative path part
   //
-  // 例如：local_prefix_ = "/mnt/nfs_rocksdb/db"
-  //       nfs_url_ = "nfs://192.168.1.100/shared/rocksdb"
-  //       path = "/mnt/nfs_rocksdb/db/0/xxx.sst"
+  // Example: local_prefix_ = "/mnt/nfs_rocksdb/db"
+  //          nfs_url_ = "nfs://192.168.1.100/shared/rocksdb"
+  //          path = "/mnt/nfs_rocksdb/db/0/xxx.sst"
   //       
-  //       提取相对路径: "0/xxx.sst" (不带前导斜杠)
-  //       libnfs 会访问: nfs://192.168.1.100/shared/rocksdb/0/xxx.sst
+  //          Extract relative path: "0/xxx.sst" (without leading slash)
+  //          libnfs will access: nfs://192.168.1.100/shared/rocksdb/0/xxx.sst
   
-  // 首先将输入路径转换为绝对路径
+  // First convert input path to absolute path
   std::string abs_path = path;
   if (!path.empty() && path[0] != '/') {
     char cwd[PATH_MAX];

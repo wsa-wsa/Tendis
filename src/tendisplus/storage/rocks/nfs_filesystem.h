@@ -143,8 +143,12 @@ class NFSFileSystem : public FileSystemWrapper {
 
   void InitNFSContext();
   
+  // Check if the file is a data file (.sst, .blob, .ldb)
+  bool IsDataFile(const std::string& path) const;
+  
   // Check if the path should be accessed via NFS
-  // Matching criteria: Starts with localprefix, or "/nfs/", or starts with "nfs://"
+  // ALL files under local_prefix_ go to NFS to ensure consistency
+  // between local Tendis and remote workers
   bool IsNFSPath(const std::string& path) const;
   
   // Convert the local path to an NFS-relative path
