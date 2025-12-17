@@ -651,6 +651,23 @@ class ServerParams {
   std::string nfsUrl = "";           // NFS server URL, such as nfs://192.168.1.100/shared/rocksdb
   std::string nfsLocalPrefix = "";   // Local path prefixes such as /mnt/nfs_rocksdb
   std::string csaAddress = "";
+  
+  // Remote compaction configuration
+  // remote_compaction.mode: "shared_storage" or "network_transfer"
+  //   - shared_storage: Use shared filesystem (NFS/HDFS) - both sides access same files
+  //   - network_transfer: Transfer SST files over network - no shared storage needed
+  std::string remoteCompactionMode = "shared_storage";
+  
+  // Network transfer mode settings
+  std::string csaWorkDir = "/tmp/csa_work";  // CSA server working directory for temp files
+  uint64_t fileTransferChunkSize = 4194304;  // 4MB chunks for file transfer
+  uint32_t fileTransferTimeout = 300;        // Timeout in seconds for file transfer
+  uint32_t fileTransferRetries = 3;          // Number of retries for failed transfers
+  
+  // CSA server settings
+  uint32_t csaMaxConcurrentTasks = 5;        // Max concurrent compaction tasks on CSA
+  uint32_t csaConnectionTimeout = 30;        // Connection timeout in seconds
+  uint32_t csaRequestTimeout = 600;          // Request timeout in seconds
 };
 
 extern std::shared_ptr<tendisplus::ServerParams> gParams;

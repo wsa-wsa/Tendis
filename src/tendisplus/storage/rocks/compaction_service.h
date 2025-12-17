@@ -1,9 +1,16 @@
 #pragma once
 #include <string>
+#include <functional>
 #include "monitoring/instrumented_mutex.h"
 #include "rocksdb/options.h"
+#include "rocksdb/metadata.h"
+#include "remote_compaction/def.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// Callback type for getting live file metadata from DB
+// Used in network transfer mode (方案三) to get SST file metadata
+using GetLiveFilesMetaDataCallback = std::function<void(std::vector<LiveFileMetaData>*)>;
 
 class MyTestCompactionService : public CompactionService {
  public:
@@ -15,7 +22,8 @@ class MyTestCompactionService : public CompactionService {
           table_properties_collector_factories,
       const std::string& shared_fs_uri = "",
       const std::string& shared_fs_local_prefix = "",
-      const std::string& csa_address = "")
+      const std::string& csa_address = "",
+      RemoteCompactionMode mode = RemoteCompactionMode::kSharedStorage)
       : db_path_(std::move(db_path)),
         options_(options),
         statistics_(statistics),
@@ -26,7 +34,8 @@ class MyTestCompactionService : public CompactionService {
             std::move(table_properties_collector_factories)),
         shared_fs_uri_(shared_fs_uri),
         shared_fs_local_prefix_(shared_fs_local_prefix),
-        csa_address_(csa_address){}
+        csa_address_(csa_address),
+        mode_(mode) {}
 
   static const char* kClassName() { return "MyTestCompactionService"; }
 
@@ -68,6 +77,11 @@ class MyTestCompactionService : public CompactionService {
 
   void SetCanceled(bool canceled) { canceled_ = canceled; }
 
+  // Set callback for getting live file metadata (方案三)
+  void SetGetLiveFilesMetaDataCallback(GetLiveFilesMetaDataCallback callback) {
+    get_live_files_metadata_callback_ = std::move(callback);
+  }
+
  private:
   InstrumentedMutex mutex_;
   std::atomic_int compaction_num_{0};
@@ -95,5 +109,20 @@ class MyTestCompactionService : public CompactionService {
 
   // server_address
   std::string csa_address_;
+  
+  // Remote compaction mode
+  RemoteCompactionMode mode_;
+  
+  // Callback for getting live file metadata (方案三)
+  GetLiveFilesMetaDataCallback get_live_files_metadata_callback_;
+  
+  // Helper methods for network transfer mode
+  // input_files: pairs of {local_path, relative_path}
+  Status UploadInputFiles(const std::string& job_id,
+                          const std::vector<std::pair<std::string, std::string>>& input_files,
+                          uint64_t numeric_job_id);
+  Status DownloadOutputFiles(const std::string& job_id,
+                             const std::string& output_dir);
+  Status CleanupRemoteJob(const std::string& job_id);
 };
 }  // namespace ROCKSDB_NAMESPACE

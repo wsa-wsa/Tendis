@@ -626,6 +626,16 @@ ServerParams::ServerParams() {
   REGISTER_VARS_DIFF_NAME("nfs.url", nfsUrl);
   REGISTER_VARS_DIFF_NAME("nfs.local_prefix", nfsLocalPrefix);
   REGISTER_VARS_DIFF_NAME("csa_address", csaAddress);
+  
+  // Remote compaction配置
+  REGISTER_VARS_DIFF_NAME("remote_compaction.mode", remoteCompactionMode);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.csa_work_dir", csaWorkDir);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.file_transfer_chunk_size", fileTransferChunkSize);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.file_transfer_timeout", fileTransferTimeout);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.file_transfer_retries", fileTransferRetries);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.csa_max_concurrent_tasks", csaMaxConcurrentTasks);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.csa_connection_timeout", csaConnectionTimeout);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.csa_request_timeout", csaRequestTimeout);
 }
 
 ServerParams::~ServerParams() {

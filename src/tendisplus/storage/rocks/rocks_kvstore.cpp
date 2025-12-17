@@ -2214,13 +2214,29 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
     std::string local_prefix;
     std::string csa_address;
     bool nfs_enabled = false;
+    rocksdb::RemoteCompactionMode remote_compaction_mode = 
+        rocksdb::RemoteCompactionMode::kSharedStorage;
     
-    // Priority 1: Profile
+    // Read CSA address (always needed for remote compaction)
+    if (gParams && !gParams->csaAddress.empty()) {
+      csa_address = gParams->csaAddress;
+      LOG(INFO) << "CSA address configured: " << csa_address;
+    }
+    
+    // Parse remote compaction mode
+    if (gParams && gParams->remoteCompactionMode == "network_transfer") {
+      remote_compaction_mode = rocksdb::RemoteCompactionMode::kNetworkTransfer;
+      LOG(INFO) << "Remote compaction mode: network_transfer";
+    } else {
+      LOG(INFO) << "Remote compaction mode: shared_storage";
+    }
+    
+    // NFS configuration (for shared storage mode)
     if (gParams && gParams->nfsEnabled) {
       nfs_enabled = true;
       nfs_url = gParams->nfsUrl;
       local_prefix = gParams->nfsLocalPrefix;
-      csa_address = gParams->csaAddress;
+      
       LOG(INFO) << "NFS config from file: enabled=" << nfs_enabled
                 << ", url=" << nfs_url
                 << ", local_prefix=" << local_prefix
@@ -2244,6 +2260,7 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
         // rocksdb::NewNFSFileSystemSimple(nfs_url, local_prefix, &_nfsFileSystem);
       
       if (!nfs_status.ok()) {
+        
         LOG(ERROR) << "Failed to create NFS FileSystem: "
                    << nfs_status.ToString()
                    << ", falling back to default filesystem";
@@ -2279,7 +2296,7 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
       auto& remote_listeners =
         const_cast<std::vector<std::shared_ptr<rocksdb::EventListener>>&>(
           dbOpts.listeners);
-      tmp_options.compaction_service =
+      auto compaction_svc =
         std::make_shared<rocksdb::MyTestCompactionService>(
           dbname,
           tmp_options,
@@ -2288,7 +2305,9 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
           remote_table_properties_collector_factories,
           nfs_url,
           local_prefix,
-          csa_address);
+          csa_address,
+          remote_compaction_mode);
+      tmp_options.compaction_service = compaction_svc;
       auto status = rocksdb::OptimisticTransactionDB::Open(
         dbOpts,
         dbname,
@@ -2301,6 +2320,17 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
         }
         return {ErrorCodes::ERR_INTERNAL, status.ToString()};
       }
+      
+      // Set callback for getting live file metadata (方案三)
+      if (remote_compaction_mode == rocksdb::RemoteCompactionMode::kNetworkTransfer) {
+        rocksdb::DB* base_db = tmpDb->GetBaseDB();
+        compaction_svc->SetGetLiveFilesMetaDataCallback(
+          [base_db](std::vector<rocksdb::LiveFileMetaData>* metadata) {
+            base_db->GetLiveFilesMetaData(metadata);
+          });
+        LOG(INFO) << "Set GetLiveFilesMetaData callback for network transfer mode";
+      }
+      
       rocksdb::ReadOptions readOpts;
       if (_cfg->forceRecovery) {
         readOpts.verify_checksums = false;
@@ -2337,7 +2367,7 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
         const_cast<std::vector<std::shared_ptr<rocksdb::EventListener>>&>(
           dbOpts.listeners);
       
-      tmp_options.compaction_service =
+      auto compaction_svc =
         std::make_shared<rocksdb::MyTestCompactionService>(
           dbname,
           tmp_options,
@@ -2346,7 +2376,9 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
           remote_table_properties_collector_factories,
           nfs_url,
           local_prefix,
-          csa_address);
+          csa_address,
+          remote_compaction_mode);
+      tmp_options.compaction_service = compaction_svc;
 
       // rocksdb::DB* db;
       // rocksdb::DB::Open(dbOpts, "/nfs/rocksdb_data", &db);
@@ -2360,6 +2392,17 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
         }
         return {ErrorCodes::ERR_INTERNAL, status.ToString()};
       }
+      
+      // Set callback for getting live file metadata (方案三)
+      if (remote_compaction_mode == rocksdb::RemoteCompactionMode::kNetworkTransfer) {
+        rocksdb::DB* base_db = tmpDb->GetBaseDB();
+        compaction_svc->SetGetLiveFilesMetaDataCallback(
+          [base_db](std::vector<rocksdb::LiveFileMetaData>* metadata) {
+            base_db->GetLiveFilesMetaData(metadata);
+          });
+        LOG(INFO) << "Set GetLiveFilesMetaData callback for network transfer mode";
+      }
+      
       LOG(INFO) << "rocksdb Open sucess,id:" << dbId() << " dbname:" << dbname;
       rocksdb::ReadOptions readOpts;
       if (_cfg->forceRecovery) {
