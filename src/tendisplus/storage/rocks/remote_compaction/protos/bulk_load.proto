@@ -1,0 +1,383 @@
+// Copyright (c) 2024-present, Tencent Inc. All rights reserved.
+// 远程 Bulk Load gRPC 协议定义
+
+syntax = "proto3";
+
+package tendisplus.bulk_load;
+
+option go_package = "tendisplus/bulk_load";
+
+import "control_plane.proto";
+
+// ============================================================================
+// Bulk Load 任务相关消息
+// ============================================================================
+
+// 数据分片信息
+message DataShard {
+  string shard_id = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  uint64 estimated_size = 4;
+  uint64 estimated_records = 5;
+  string source_path = 6;
+  repeated string source_files = 7;
+  uint32 slot_start = 8;  // TendisPlus slot 范围
+  uint32 slot_end = 9;
+}
+
+// SST 文件生成配置
+message SstBuildConfig {
+  uint64 target_file_size = 1;
+  string compression_type = 2;  // none, snappy, zstd, lz4
+  int32 compression_level = 3;
+  bool enable_bloom_filter = 4;
+  uint32 bloom_bits_per_key = 5;
+  bool enable_index_compression = 6;
+  string checksum_type = 7;  // crc32c, xxhash
+  uint64 block_size = 8;
+  bool enable_data_block_hash_index = 9;
+}
+
+// SST 文件元数据
+message SstFileMetadata {
+  string file_id = 1;
+  string file_name = 2;
+  string file_path = 3;
+  uint64 file_size = 4;
+  bytes smallest_key = 5;
+  bytes largest_key = 6;
+  uint64 smallest_seqno = 7;
+  uint64 largest_seqno = 8;
+  uint64 num_entries = 9;
+  uint64 num_deletions = 10;
+  uint64 raw_key_size = 11;
+  uint64 raw_value_size = 12;
+  string checksum = 13;
+  string checksum_type = 14;
+  int32 target_level = 15;
+  control_plane.Timestamp created_at = 16;
+  map<string, string> properties = 17;
+}
+
+// Bulk Load 任务状态
+enum BulkLoadStatus {
+  BULK_LOAD_STATUS_UNKNOWN = 0;
+  BULK_LOAD_STATUS_PREPARING = 1;      // 数据准备中
+  BULK_LOAD_STATUS_SHARDING = 2;       // 数据分片中
+  BULK_LOAD_STATUS_BUILDING = 3;       // SST 构建中
+  BULK_LOAD_STATUS_UPLOADING = 4;      // 上传共享存储中
+  BULK_LOAD_STATUS_VALIDATING = 5;     // 校验中
+  BULK_LOAD_STATUS_INGESTING = 6;      // Ingest 中
+  BULK_LOAD_STATUS_COMPLETED = 7;      // 完成
+  BULK_LOAD_STATUS_FAILED = 8;         // 失败
+  BULK_LOAD_STATUS_CANCELLED = 9;      // 已取消
+  BULK_LOAD_STATUS_ROLLING_BACK = 10;  // 回滚中
+}
+
+// 分片任务状态
+message ShardTaskStatus {
+  string shard_id = 1;
+  BulkLoadStatus status = 2;
+  double progress_percent = 3;
+  uint64 records_processed = 4;
+  uint64 bytes_processed = 5;
+  string assigned_worker_id = 6;
+  repeated SstFileMetadata generated_files = 7;
+  string error_message = 8;
+  control_plane.Timestamp started_at = 9;
+  control_plane.Timestamp completed_at = 10;
+}
+
+// Bulk Load 作业
+message BulkLoadJob {
+  string job_id = 1;
+  string job_name = 2;
+  BulkLoadStatus status = 3;
+  
+  // 源数据信息
+  string source_type = 4;  // file, stream, remote
+  string source_path = 5;
+  uint64 total_data_size = 6;
+  uint64 total_records = 7;
+  
+  // 目标信息
+  string target_cluster_id = 8;
+  string target_db_name = 9;
+  repeated uint32 target_store_ids = 10;
+  
+  // 分片信息
+  repeated DataShard shards = 11;
+  map<string, ShardTaskStatus> shard_status = 12;
+  
+  // 配置
+  SstBuildConfig sst_config = 13;
+  control_plane.RetryPolicy retry_policy = 14;
+  uint32 max_parallel_shards = 15;
+  uint64 rate_limit_bytes_per_sec = 16;
+  
+  // 进度统计
+  uint32 total_shards = 17;
+  uint32 completed_shards = 18;
+  uint32 failed_shards = 19;
+  double overall_progress = 20;
+  
+  // 生成的文件
+  repeated SstFileMetadata output_files = 21;
+  
+  // 时间信息
+  control_plane.Timestamp created_at = 22;
+  control_plane.Timestamp started_at = 23;
+  control_plane.Timestamp completed_at = 24;
+  
+  // 错误信息
+  string error_message = 25;
+  repeated string warnings = 26;
+  
+  map<string, string> metadata = 27;
+}
+
+// ============================================================================
+// SST Ingest 相关消息
+// ============================================================================
+
+// Ingest 选项
+message IngestOptions {
+  bool move_files = 1;                    // 是否移动而非复制
+  bool snapshot_consistency = 2;          // 是否保证快照一致性
+  bool allow_global_seqno = 3;            // 是否允许全局序列号
+  bool allow_blocking_flush = 4;          // 是否允许阻塞 flush
+  bool ingest_behind = 5;                 // 是否 ingest 到最底层
+  bool fail_if_not_bottommost_level = 6;  // 如果不是最底层是否失败
+  bool write_global_seqno = 7;            // 是否写入全局序列号
+  bool verify_checksums_before_ingest = 8; // ingest 前是否校验
+  bool verify_checksums_readahead_size = 9;
+  uint64 verify_file_checksum = 10;
+}
+
+// Ingest 请求
+message IngestRequest {
+  string store_id = 1;
+  repeated SstFileMetadata files = 2;
+  IngestOptions options = 3;
+  string column_family = 4;
+  control_plane.Timestamp deadline = 5;
+}
+
+// Ingest 结果
+message IngestResult {
+  bool success = 1;
+  string error_message = 2;
+  repeated string ingested_files = 3;
+  repeated string failed_files = 4;
+  uint64 total_bytes_ingested = 5;
+  uint64 total_keys_ingested = 6;
+  control_plane.Timestamp completed_at = 7;
+}
+
+// ============================================================================
+// Bulk Load 服务 RPC
+// ============================================================================
+
+// 创建 Bulk Load 作业
+message CreateBulkLoadJobRequest {
+  string job_name = 1;
+  string source_type = 2;
+  string source_path = 3;
+  string target_cluster_id = 4;
+  string target_db_name = 5;
+  repeated uint32 target_store_ids = 6;
+  SstBuildConfig sst_config = 7;
+  control_plane.RetryPolicy retry_policy = 8;
+  uint32 max_parallel_shards = 9;
+  uint64 rate_limit_bytes_per_sec = 10;
+  map<string, string> metadata = 11;
+}
+
+message CreateBulkLoadJobResponse {
+  bool success = 1;
+  string job_id = 2;
+  string error_message = 3;
+}
+
+// 启动 Bulk Load 作业
+message StartBulkLoadJobRequest {
+  string job_id = 1;
+}
+
+message StartBulkLoadJobResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// 暂停 Bulk Load 作业
+message PauseBulkLoadJobRequest {
+  string job_id = 1;
+}
+
+message PauseBulkLoadJobResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// 恢复 Bulk Load 作业
+message ResumeBulkLoadJobRequest {
+  string job_id = 1;
+}
+
+message ResumeBulkLoadJobResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// 取消 Bulk Load 作业
+message CancelBulkLoadJobRequest {
+  string job_id = 1;
+  string reason = 2;
+}
+
+message CancelBulkLoadJobResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// 查询 Bulk Load 作业
+message GetBulkLoadJobRequest {
+  string job_id = 1;
+}
+
+message GetBulkLoadJobResponse {
+  bool found = 1;
+  BulkLoadJob job = 2;
+}
+
+// 列出 Bulk Load 作业
+message ListBulkLoadJobsRequest {
+  BulkLoadStatus status = 1;
+  string target_cluster_id = 2;
+  uint32 limit = 3;
+  uint32 offset = 4;
+}
+
+message ListBulkLoadJobsResponse {
+  repeated BulkLoadJob jobs = 1;
+  uint32 total_count = 2;
+}
+
+// 分片任务完成上报
+message ReportShardCompletedRequest {
+  string job_id = 1;
+  string shard_id = 2;
+  string worker_id = 3;
+  repeated SstFileMetadata generated_files = 4;
+  uint64 records_processed = 5;
+  uint64 bytes_processed = 6;
+  control_plane.Timestamp completed_at = 7;
+}
+
+message ReportShardCompletedResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// 分片任务失败上报
+message ReportShardFailedRequest {
+  string job_id = 1;
+  string shard_id = 2;
+  string worker_id = 3;
+  string error_message = 4;
+  bool retryable = 5;
+}
+
+message ReportShardFailedResponse {
+  bool success = 1;
+  bool will_retry = 2;
+  string error_message = 3;
+}
+
+// 请求 Ingest SST 文件
+message RequestIngestRequest {
+  string job_id = 1;
+  string store_id = 2;
+  repeated SstFileMetadata files = 3;
+  IngestOptions options = 4;
+}
+
+message RequestIngestResponse {
+  bool success = 1;
+  string ingest_task_id = 2;
+  string error_message = 3;
+}
+
+// 上报 Ingest 结果
+message ReportIngestResultRequest {
+  string job_id = 1;
+  string store_id = 2;
+  string ingest_task_id = 3;
+  IngestResult result = 4;
+}
+
+message ReportIngestResultResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// ============================================================================
+// Worker 端 Bulk Load 任务 RPC
+// ============================================================================
+
+// 分配分片任务给 Worker
+message AssignShardTaskRequest {
+  string job_id = 1;
+  DataShard shard = 2;
+  SstBuildConfig sst_config = 3;
+  string shared_storage_path = 4;
+  uint64 rate_limit_bytes_per_sec = 5;
+}
+
+message AssignShardTaskResponse {
+  bool accepted = 1;
+  string error_message = 2;
+}
+
+// 取消分片任务
+message CancelShardTaskRequest {
+  string job_id = 1;
+  string shard_id = 2;
+  string reason = 3;
+}
+
+message CancelShardTaskResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// ============================================================================
+// 服务定义
+// ============================================================================
+
+// Bulk Load 控制服务 (供 TendisPlus 节点和管理端调用)
+service BulkLoadControlService {
+  // 作业管理
+  rpc CreateBulkLoadJob(CreateBulkLoadJobRequest) returns (CreateBulkLoadJobResponse);
+  rpc StartBulkLoadJob(StartBulkLoadJobRequest) returns (StartBulkLoadJobResponse);
+  rpc PauseBulkLoadJob(PauseBulkLoadJobRequest) returns (PauseBulkLoadJobResponse);
+  rpc ResumeBulkLoadJob(ResumeBulkLoadJobRequest) returns (ResumeBulkLoadJobResponse);
+  rpc CancelBulkLoadJob(CancelBulkLoadJobRequest) returns (CancelBulkLoadJobResponse);
+  rpc GetBulkLoadJob(GetBulkLoadJobRequest) returns (GetBulkLoadJobResponse);
+  rpc ListBulkLoadJobs(ListBulkLoadJobsRequest) returns (ListBulkLoadJobsResponse);
+  
+  // 任务上报 (Worker 调用)
+  rpc ReportShardCompleted(ReportShardCompletedRequest) returns (ReportShardCompletedResponse);
+  rpc ReportShardFailed(ReportShardFailedRequest) returns (ReportShardFailedResponse);
+  
+  // Ingest 协调 (TendisPlus 节点调用)
+  rpc RequestIngest(RequestIngestRequest) returns (RequestIngestResponse);
+  rpc ReportIngestResult(ReportIngestResultRequest) returns (ReportIngestResultResponse);
+}
+
+// Bulk Load Worker 服务 (供控制平面调用)
+service BulkLoadWorkerService {
+  rpc AssignShardTask(AssignShardTaskRequest) returns (AssignShardTaskResponse);
+  rpc CancelShardTask(CancelShardTaskRequest) returns (CancelShardTaskResponse);
+}

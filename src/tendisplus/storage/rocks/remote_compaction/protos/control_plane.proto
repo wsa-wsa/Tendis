@@ -1,0 +1,424 @@
+// Copyright (c) 2024-present, Tencent Inc. All rights reserved.
+// 控制平面 gRPC 协议定义
+
+syntax = "proto3";
+
+package tendisplus.control_plane;
+
+option go_package = "tendisplus/control_plane";
+
+// ============================================================================
+// 通用消息
+// ============================================================================
+
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos = 2;
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+// ============================================================================
+// 任务相关消息
+// ============================================================================
+
+enum TaskType {
+  TASK_TYPE_UNKNOWN = 0;
+  TASK_TYPE_COMPACTION = 1;
+  TASK_TYPE_BULK_LOAD = 2;
+  TASK_TYPE_BACKUP = 3;
+  TASK_TYPE_RESTORE = 4;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNKNOWN = 0;
+  TASK_STATUS_CREATED = 1;
+  TASK_STATUS_QUEUED = 2;
+  TASK_STATUS_SCHEDULED = 3;
+  TASK_STATUS_RUNNING = 4;
+  TASK_STATUS_COMPLETED = 5;
+  TASK_STATUS_FAILED = 6;
+  TASK_STATUS_RETRYING = 7;
+  TASK_STATUS_CANCELLED = 8;
+}
+
+enum TaskPriority {
+  TASK_PRIORITY_LOW = 0;
+  TASK_PRIORITY_NORMAL = 1;
+  TASK_PRIORITY_HIGH = 2;
+  TASK_PRIORITY_URGENT = 3;
+}
+
+message ResourceRequirement {
+  uint32 cpu_cores = 1;
+  uint64 memory_mb = 2;
+  uint64 disk_mb = 3;
+  uint64 network_bandwidth_mbps = 4;
+  uint32 estimated_duration_sec = 5;
+}
+
+message RetryPolicy {
+  uint32 max_retries = 1;
+  uint32 initial_delay_ms = 2;
+  uint32 max_delay_ms = 3;
+  double backoff_multiplier = 4;
+  bool retry_on_timeout = 5;
+  bool retry_on_worker_failure = 6;
+}
+
+message SstFileInfo {
+  string file_name = 1;
+  uint64 file_number = 2;
+  int32 level = 3;
+  uint64 file_size = 4;
+  bytes smallest_key = 5;
+  bytes largest_key = 6;
+  uint64 smallest_seqno = 7;
+  uint64 largest_seqno = 8;
+  uint64 epoch_number = 9;
+  string checksum = 10;
+}
+
+message CompactionTaskParams {
+  int32 input_level = 1;
+  int32 output_level = 2;
+  repeated SstFileInfo input_files = 3;
+  string db_path = 4;
+  string output_path = 5;
+  bytes compaction_input = 6;  // RocksDB CompactionServiceInput 序列化数据
+  uint64 target_file_size = 7;
+  bool is_manual = 8;
+}
+
+message BulkLoadTaskParams {
+  string source_path = 1;
+  string target_db_path = 2;
+  repeated string data_files = 3;
+  bool verify_checksum = 4;
+  bool move_files = 5;
+}
+
+message StateTransition {
+  TaskStatus from_status = 1;
+  TaskStatus to_status = 2;
+  Timestamp timestamp = 3;
+  string reason = 4;
+  string operator_id = 5;
+}
+
+message TaskResult {
+  bool success = 1;
+  string error_message = 2;
+  repeated SstFileInfo output_files = 3;
+  uint64 bytes_read = 4;
+  uint64 bytes_written = 5;
+  uint64 records_processed = 6;
+  uint64 execution_time_ms = 7;
+  map<string, string> file_checksums = 8;
+}
+
+message BackgroundTask {
+  string task_id = 1;
+  TaskType task_type = 2;
+  TaskStatus status = 3;
+  TaskPriority priority = 4;
+  
+  string source_node_id = 5;
+  string source_db_name = 6;
+  uint32 store_id = 7;
+  
+  ResourceRequirement resource_requirement = 8;
+  string assigned_worker_id = 9;
+  
+  repeated string depends_on = 10;
+  repeated string blocked_by = 11;
+  
+  RetryPolicy retry_policy = 12;
+  uint32 retry_count = 13;
+  
+  Timestamp created_at = 14;
+  Timestamp queued_at = 15;
+  Timestamp scheduled_at = 16;
+  Timestamp started_at = 17;
+  Timestamp completed_at = 18;
+  Timestamp deadline = 19;
+  
+  repeated StateTransition state_history = 20;
+  
+  CompactionTaskParams compaction_params = 21;
+  BulkLoadTaskParams bulk_load_params = 22;
+  
+  TaskResult result = 23;
+  
+  map<string, string> metadata = 24;
+  uint64 version = 25;
+}
+
+// ============================================================================
+// Worker 相关消息
+// ============================================================================
+
+enum WorkerStatus {
+  WORKER_STATUS_UNKNOWN = 0;
+  WORKER_STATUS_ONLINE = 1;
+  WORKER_STATUS_OFFLINE = 2;
+  WORKER_STATUS_BUSY = 3;
+  WORKER_STATUS_DRAINING = 4;
+  WORKER_STATUS_MAINTENANCE = 5;
+}
+
+message WorkerResources {
+  uint32 total_cpu_cores = 1;
+  uint64 total_memory_mb = 2;
+  uint64 total_disk_mb = 3;
+  uint64 network_bandwidth_mbps = 4;
+  uint32 used_cpu_cores = 5;
+  uint64 used_memory_mb = 6;
+  uint64 used_disk_mb = 7;
+}
+
+message WorkerLoad {
+  double cpu_usage_percent = 1;
+  double memory_usage_percent = 2;
+  double disk_io_percent = 3;
+  double network_io_percent = 4;
+  uint32 active_task_count = 5;
+  uint32 pending_task_count = 6;
+  uint64 bytes_processed_per_sec = 7;
+}
+
+message WorkerInfo {
+  string worker_id = 1;
+  string address = 2;
+  WorkerStatus status = 3;
+  WorkerResources resources = 4;
+  WorkerLoad load = 5;
+  Timestamp last_heartbeat = 6;
+  Timestamp registered_at = 7;
+  uint64 heartbeat_count = 8;
+  uint64 total_tasks_completed = 9;
+  uint64 total_tasks_failed = 10;
+  uint64 total_bytes_processed = 11;
+  map<string, string> labels = 12;
+  repeated string running_task_ids = 13;
+}
+
+// ============================================================================
+// 任务管理 RPC
+// ============================================================================
+
+message SubmitTaskRequest {
+  TaskType task_type = 1;
+  TaskPriority priority = 2;
+  string source_node_id = 3;
+  string source_db_name = 4;
+  uint32 store_id = 5;
+  ResourceRequirement resource_requirement = 6;
+  RetryPolicy retry_policy = 7;
+  repeated string depends_on = 8;
+  Timestamp deadline = 9;
+  CompactionTaskParams compaction_params = 10;
+  BulkLoadTaskParams bulk_load_params = 11;
+  map<string, string> metadata = 12;
+}
+
+message SubmitTaskResponse {
+  bool success = 1;
+  string task_id = 2;
+  string error_message = 3;
+}
+
+message CancelTaskRequest {
+  string task_id = 1;
+  string reason = 2;
+}
+
+message CancelTaskResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message QueryTaskRequest {
+  string task_id = 1;
+}
+
+message QueryTaskResponse {
+  bool found = 1;
+  BackgroundTask task = 2;
+}
+
+message ListTasksRequest {
+  TaskType task_type = 1;
+  TaskStatus status = 2;
+  TaskPriority priority = 3;
+  string source_node_id = 4;
+  string assigned_worker_id = 5;
+  Timestamp created_after = 6;
+  Timestamp created_before = 7;
+  uint32 limit = 8;
+  uint32 offset = 9;
+}
+
+message ListTasksResponse {
+  repeated BackgroundTask tasks = 1;
+  uint32 total_count = 2;
+}
+
+message TaskStatistics {
+  map<string, uint64> status_counts = 1;
+  map<string, uint64> type_counts = 2;
+  uint64 total_tasks = 3;
+  uint64 active_tasks = 4;
+  uint64 completed_tasks = 5;
+  uint64 failed_tasks = 6;
+  double avg_execution_time_ms = 7;
+  double avg_queue_time_ms = 8;
+}
+
+message GetTaskStatisticsRequest {}
+
+message GetTaskStatisticsResponse {
+  TaskStatistics statistics = 1;
+}
+
+// ============================================================================
+// Worker 管理 RPC
+// ============================================================================
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string address = 2;
+  WorkerResources resources = 3;
+  map<string, string> labels = 4;
+}
+
+message RegisterWorkerResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message UnregisterWorkerRequest {
+  string worker_id = 1;
+}
+
+message UnregisterWorkerResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  WorkerLoad load = 2;
+  WorkerResources resources = 3;
+  repeated string running_task_ids = 4;
+}
+
+message HeartbeatResponse {
+  bool success = 1;
+  repeated string tasks_to_cancel = 2;  // 需要取消的任务
+}
+
+message ListWorkersRequest {
+  WorkerStatus status = 1;
+}
+
+message ListWorkersResponse {
+  repeated WorkerInfo workers = 1;
+}
+
+// ============================================================================
+// 任务执行 RPC (Worker -> Control Plane)
+// ============================================================================
+
+message ReportTaskProgressRequest {
+  string task_id = 1;
+  string worker_id = 2;
+  double progress_percent = 3;
+  uint64 bytes_processed = 4;
+  uint64 records_processed = 5;
+  string status_message = 6;
+}
+
+message ReportTaskProgressResponse {
+  bool success = 1;
+  bool should_cancel = 2;
+}
+
+message ReportTaskResultRequest {
+  string task_id = 1;
+  string worker_id = 2;
+  TaskResult result = 3;
+}
+
+message ReportTaskResultResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// ============================================================================
+// 任务分发 RPC (Control Plane -> Worker)
+// ============================================================================
+
+message AssignTaskRequest {
+  BackgroundTask task = 1;
+}
+
+message AssignTaskResponse {
+  bool accepted = 1;
+  string error_message = 2;
+}
+
+message CancelWorkerTaskRequest {
+  string task_id = 1;
+  string reason = 2;
+}
+
+message CancelWorkerTaskResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// ============================================================================
+// 服务定义
+// ============================================================================
+
+// 控制平面服务 (供 TendisPlus 节点和 Worker 调用)
+service ControlPlaneService {
+  // 任务管理
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+  rpc QueryTask(QueryTaskRequest) returns (QueryTaskResponse);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc GetTaskStatistics(GetTaskStatisticsRequest) returns (GetTaskStatisticsResponse);
+  
+  // Worker 管理
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc UnregisterWorker(UnregisterWorkerRequest) returns (UnregisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+  
+  // 任务结果上报
+  rpc ReportTaskProgress(ReportTaskProgressRequest) returns (ReportTaskProgressResponse);
+  rpc ReportTaskResult(ReportTaskResultRequest) returns (ReportTaskResultResponse);
+}
+
+// Worker 服务 (供控制平面调用)
+service WorkerService {
+  // 任务分发
+  rpc AssignTask(AssignTaskRequest) returns (AssignTaskResponse);
+  rpc CancelTask(CancelWorkerTaskRequest) returns (CancelWorkerTaskResponse);
+  
+  // 健康检查
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string status = 2;
+  map<string, string> details = 3;
+}
