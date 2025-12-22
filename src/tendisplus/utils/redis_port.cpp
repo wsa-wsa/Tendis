@@ -921,6 +921,8 @@ void memrev64(void* p) {
   x[4] = t;
 }
 
+// macOS already defines htonll/ntohll as macros in system headers, no need to define
+#if !defined(__APPLE__)
 uint64_t htonll(uint64_t v) {
   memrev64(&v);
   return v;
@@ -930,6 +932,7 @@ uint64_t ntohll(uint64_t v) {
   memrev64(&v);
   return v;
 }
+#endif
 
 /* We have 16384 hash slots. The hash slot of a given key is obtained
  * as the least significant 14 bits of the crc16 of the key.
@@ -1521,6 +1524,10 @@ static dummyClass dummy;
 /* Like serverLogRaw() but with printf-alike support. This is the function that
  * is used across the code. The raw version is only used in order to dump
  * the INFO output on crash. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#endif
 void serverLogOld(int level, const char* fmt, ...) {
   va_list ap;
   char msg[1024];
@@ -1548,6 +1555,9 @@ void serverLogOld(int level, const char* fmt, ...) {
       break;
   }
 }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 void sha256_transform(SHA256_CTX* ctx, const BYTE data[]) {
   WORD a, b, c, d, e, f, g, h, i, j, t1, t2, m[64];

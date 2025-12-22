@@ -30,6 +30,7 @@
 #define be32toh(x) _byteswap_ulong(x)
 #else
 #define MYTEST TEST
+#include "tendisplus/include/endian.h"
 #endif
 
 namespace tendisplus {

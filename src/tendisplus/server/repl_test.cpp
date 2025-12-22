@@ -21,6 +21,7 @@
 #include "tendisplus/utils/scopeguard.h"
 #include "tendisplus/utils/sync_point.h"
 #include "tendisplus/utils/test_util.h"
+#include "tendisplus/include/endian.h"
 
 namespace tendisplus {
 

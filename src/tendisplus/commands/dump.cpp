@@ -90,7 +90,11 @@ Expected<size_t> Serializer::saveLen(std::vector<byte>* payload,
     if (1 != easyCopy(payload, pos, header, 1)) {
       return {ErrorCodes::ERR_INTERNAL, "copy len to buffer failed"};
     }
+#ifdef __APPLE__
+    uint64_t len64 = htonll(static_cast<uint64_t>(len));
+#else
     uint64_t len64 = redis_port::htonll(static_cast<uint64_t>(len));
+#endif
     return (1 + easyCopy(payload, pos, len64));
   }
 }
@@ -787,7 +791,11 @@ Expected<size_t> Deserializer::loadLen(const std::string& payload,
   } else if (buf[0] == RDB_64BITLEN) {
     uint64_t len64;
     INVARIANT(easyCopy(&len64, payload, pos) == 8);
+#ifdef __APPLE__
+    ret = ntohll(len64);
+#else
     ret = redis_port::ntohll(len64);
+#endif
   } else {
     return {ErrorCodes::ERR_INTERNAL, "Unknown length encoding"};
   }

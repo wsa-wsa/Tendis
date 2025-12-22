@@ -4683,7 +4683,14 @@ void ClusterState::cronCheckDisk() {
       }
     });
 
+#ifdef __APPLE__
+    fd = open(file_name.c_str(), O_CREAT | O_RDWR, 0600);
+    if (fd != -1) {
+      fcntl(fd, F_NOCACHE, 1);  // macOS alternative to O_DIRECT
+    }
+#else
     fd = open(file_name.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0600);
+#endif
     if (fd == -1) {
       LOG(INFO) << file_name << " open err:" << strerror(errno);
       return false;

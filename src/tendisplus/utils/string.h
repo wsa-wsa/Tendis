@@ -148,7 +148,6 @@ std::string bitsetEncode(const std::bitset<size>& bitmap) {
 
 template <size_t size>
 Expected<std::bitset<size>> bitsetDecode(const char* str, size_t max_size) {
-  std::bitset<size> bitmap;
   size_t offset = 0;
 
   if (max_size < sizeof(uint32_t)) {

@@ -3,12 +3,18 @@ target_link_libraries(commands status skiplist network utils_common lock utils_c
 
 if(TENDIS_WITH_UNIT_TESTS)
 add_executable(command_test command_test.cpp)
-if(CMAKE_COMPILER_IS_GNUCC)
+if(APPLE)
+	# macOS: use -force_load (ld64 linker)
+	target_link_libraries(command_test status server session network server_params utils_common gtest_main test_util ${SYS_LIBS})
+	target_link_libraries(command_test -Wl,-force_load,$<TARGET_FILE:commands>)
+elseif(MSVC)
+	# Windows: use /WHOLEARCHIVE
+	target_link_libraries(command_test commands status server session network server_params utils_common gtest_main test_util ${SYS_LIBS})
+	set_target_properties(command_test PROPERTIES LINK_FLAGS "/WHOLEARCHIVE:commands")
+else()
+	# Linux/Unix (GCC or Clang): use --whole-archive (GNU ld)
 	# command uses global variables to self-regist, linking flag whole-archive is required.
 	target_link_libraries(command_test -Wl,--whole-archive commands -Wl,--no-whole-archive)
 	target_link_libraries(command_test status server session network server_params stdc++fs utils_common gtest_main test_util ${SYS_LIBS})
-else()
-	target_link_libraries(command_test commands status server session network server_params utils_common gtest_main test_util ${SYS_LIBS})
-	set_target_properties(command_test PROPERTIES LINK_FLAGS "/WHOLEARCHIVE:commands")
 endif()
 endif()

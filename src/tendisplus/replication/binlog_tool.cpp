@@ -16,6 +16,7 @@
 #include "tendisplus/storage/varint.h"
 #include "tendisplus/utils/base64.h"
 #include "tendisplus/utils/param_manager.h"
+#include "tendisplus/include/endian.h"
 
 namespace tendisplus {
 

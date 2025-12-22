@@ -20,7 +20,6 @@ namespace tendisplus {
 
 constexpr uint64_t MAXSEQ = 9223372036854775807ULL;
 constexpr uint64_t INITSEQ = MAXSEQ / 2ULL;
-constexpr uint64_t MINSEQ = 1024;
 
 enum class ListPos {
   LP_HEAD,

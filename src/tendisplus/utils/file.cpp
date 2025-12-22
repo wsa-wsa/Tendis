@@ -6,7 +6,12 @@
 
 #ifndef _WIN32
 #include <sys/file.h>
+#ifdef __APPLE__
+#include <sys/param.h>
+#include <sys/mount.h>
+#else
 #include <sys/statfs.h>
+#endif
 #endif
 #include <sys/stat.h>
 

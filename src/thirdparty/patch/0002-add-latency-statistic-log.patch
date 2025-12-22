@@ -283,13 +283,14 @@ new file mode 100644
 index 000000000..7f43abcee
 --- /dev/null
 +++ b/include/rocksdb/tendis_extension.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,86 @@
 +// Copyright (C) 2020 THL A29 Limited, a Tencent company.  All rights reserved.
 +// Please refer to the license text that comes with this tendis open source
 +// project for additional information.
 +
 +#pragma once
 +
++#include <cinttypes>
 +#include <cstdint>
 +#include <string>
 +
@@ -324,10 +325,10 @@ index 000000000..7f43abcee
 +  if (G_ROCKSDB_LATENCY_LIMIT != 0 &&                                        \
 +      ROCKSDB_GET_ENDPOINT(INDEX) > G_ROCKSDB_LATENCY_LIMIT) {               \
 +    ROCKS_LOG_INFO((LOGGER),                                                 \
-+                   "latency too long follower write, wbcount:%u wbsize:%lu " \
-+                   "start ts(us):%lu join batch(us):%lu insert "             \
-+                   "memtable(us): %lu exit batch(us):%lu threadid:%s",       \
-+                   w.batch->Count(), w.batch->GetDataSize(),                 \
++                   "latency too long follower write, wbcount:%u wbsize:%" PRIu64 " " \
++                   "start ts(us):%" PRIu64 " join batch(us):%" PRIu64 " insert "     \
++                   "memtable(us): %" PRIu64 " exit batch(us):%" PRIu64 " threadid:%s", \
++                   w.batch->Count(), (uint64_t)w.batch->GetDataSize(),       \
 +                   ROCKSDB_GET_START(), ROCKSDB_GET_ENDPOINT(1),             \
 +                   ROCKSDB_GET_ENDPOINT(2), ROCKSDB_GET_ENDPOINT(3),         \
 +                   getCurThreadId().data());                                 \
@@ -338,11 +339,11 @@ index 000000000..7f43abcee
 +      ROCKSDB_GET_ENDPOINT(INDEX) > G_ROCKSDB_LATENCY_LIMIT) {               \
 +    ROCKS_LOG_INFO(                                                          \
 +        (LOGGER),                                                            \
-+        "latency too long leader write, wbcount:%u wbsize:%lu start "        \
-+        "ts(us):%lu join batch(us):%lu preprocess(us):%lu gather "           \
-+        "statistics(us):%lu write wal(us):%lu insert memtable(us):%lu exit " \
-+        "batch(us):%lu threadid:%s",                                         \
-+        w.batch->Count(), w.batch->GetDataSize(), ROCKSDB_GET_START(),       \
++        "latency too long leader write, wbcount:%u wbsize:%" PRIu64 " start "  \
++        "ts(us):%" PRIu64 " join batch(us):%" PRIu64 " preprocess(us):%" PRIu64 " gather " \
++        "statistics(us):%" PRIu64 " write wal(us):%" PRIu64 " insert memtable(us):%" PRIu64 " exit " \
++        "batch(us):%" PRIu64 " threadid:%s",                                   \
++        w.batch->Count(), (uint64_t)w.batch->GetDataSize(), ROCKSDB_GET_START(), \
 +        ROCKSDB_GET_ENDPOINT(1), ROCKSDB_GET_ENDPOINT(2),                    \
 +        ROCKSDB_GET_ENDPOINT(3), ROCKSDB_GET_ENDPOINT(4),                    \
 +        ROCKSDB_GET_ENDPOINT(5), ROCKSDB_GET_ENDPOINT(6),                    \
@@ -356,8 +357,8 @@ index 000000000..7f43abcee
 +      ROCKS_LOG_INFO(                                                        \
 +          (LOGGER),                                                          \
 +          "latency too long " TYPE                                           \
-+          ", start ts(us): %lu latency(us):%lu, size(byte):%lu threadid:%s", \
-+          timeStart, usSpend, (SIZE), getCurThreadId().data());              \
++          ", start ts(us): %" PRIu64 " latency(us):%" PRIu64 ", size(byte):%" PRIu64 " threadid:%s", \
++          timeStart, usSpend, (uint64_t)(SIZE), getCurThreadId().data());    \
 +    }                                                                        \
 +  }
 +

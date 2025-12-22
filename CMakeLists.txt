@@ -45,6 +45,17 @@ if(CMAKE_COMPILER_IS_GNUCC)
     endif()
     SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g3 -ggdb3 -gdwarf-4 -fvar-tracking-assignments -fno-omit-frame-pointer")
     SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g3 -ggdb3 -gdwarf-4 -fvar-tracking-assignments -fno-omit-frame-pointer")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Support Apple Clang and LLVM Clang
+    message("using Clang ${CMAKE_CXX_COMPILER_VERSION}")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10)
+        message(FATAL_ERROR "Clang version ${CMAKE_CXX_COMPILER_VERSION}, Require at least Clang-10")
+    endif()
+    # Clang does not support -fvar-tracking-assignments, use compatible debug options
+    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -fno-omit-frame-pointer")
+    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -fno-omit-frame-pointer")
+    # Set Clang flag for later use
+    set(COMPILER_IS_CLANG TRUE)
 elseif(MSVC AND MSVC_VERSION GREATER_EQUAL 1900)
 	message("using MSVC ${MSVC_VERSION}")
 	# TODO: check msvc version
@@ -60,7 +71,7 @@ elseif(MSVC AND MSVC_VERSION GREATER_EQUAL 1900)
 	# disable warnings
 	#add_compile_options(/wC4099)
 else()
-    message(FATAL_ERROR "gcc or vs2015(update 2)+ is required")
+    message(FATAL_ERROR "gcc, clang or vs2015(update 2)+ is required")
 endif()
 
 set(CMAKE_C_STANDARD 17)
@@ -75,7 +86,7 @@ else()
 endif()
 
 message("using rocksdb-v8.5.3")
-if(CMAKE_COMPILER_IS_GNUCC)
+if(CMAKE_COMPILER_IS_GNUCC OR COMPILER_IS_CLANG)
     set(patchCommand
         "cd ${PROJECT_SOURCE_DIR}/src/thirdparty/rocksdb/rocksdb\;
          git am --abort\;
@@ -88,6 +99,10 @@ endif()
 set(ROCKSDB_DIR "${PROJECT_SOURCE_DIR}/src/thirdparty/rocksdb")
 set(CMAKE_MODULE_PATH "${ROCKSDB_DIR}/cmake/modules/")
 add_definitions(-DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DROCKSDB_SUPPORT_THREAD_LOCAL)
+# macOS requires OS_MACOSX definition for rocksdb to correctly identify the system
+if(APPLE)
+    add_definitions(-DOS_MACOSX)
+endif()
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
@@ -129,7 +144,7 @@ if(WITH_COVER)
    add_definitions(-DWITH_COVER)
 endif()
 
-if(CMAKE_COMPILER_IS_GNUCC)
+if(CMAKE_COMPILER_IS_GNUCC OR COMPILER_IS_CLANG)
 	if(ENABLE_JEMALLOC)
 		set(JEMALLOC_ROOT_DIR "${PROJECT_SOURCE_DIR}/src/thirdparty/jemalloc")
 		add_definitions(-DTENDIS_JEMALLOC)
@@ -140,11 +155,18 @@ if(CMAKE_COMPILER_IS_GNUCC)
 
 		set(WITH_JEMALLOC ON)
 
-		add_custom_command(OUTPUT "${JEMALLOC_ROOT_DIR}/include/jemalloc/jemalloc.h"
+		if(COMPILER_IS_CLANG)
+			# Clang uses different compile options
+			add_custom_command(OUTPUT "${JEMALLOC_ROOT_DIR}/include/jemalloc/jemalloc.h"
+					COMMAND ./autogen.sh CC=clang CXX=clang++ --enable-prof --disable-shared "CFLAGS=-g" "CXXFLAGS=-g"
+					WORKING_DIRECTORY ${JEMALLOC_ROOT_DIR})
+		else()
+			add_custom_command(OUTPUT "${JEMALLOC_ROOT_DIR}/include/jemalloc/jemalloc.h"
                 # NOTE(takenliu) support jemalloc profile, before start tendisplus need export as below:
                 #     export MALLOC_CONF="prof:true,prof_prefix:jeprof.out"
-				COMMAND ./autogen.sh --enable-prof --disable-shared "CFLAGS=-Wno-missing-attributes -g3 -ggdb3 -gdwarf-4" "CXXFLAGS=-Wno-missing-attributes -g3 -ggdb3 -gdwarf-4"
-				WORKING_DIRECTORY ${JEMALLOC_ROOT_DIR})
+					COMMAND ./autogen.sh --enable-prof --disable-shared "CFLAGS=-Wno-missing-attributes -g3 -ggdb3 -gdwarf-4" "CXXFLAGS=-Wno-missing-attributes -g3 -ggdb3 -gdwarf-4"
+					WORKING_DIRECTORY ${JEMALLOC_ROOT_DIR})
+		endif()
 		add_custom_command(OUTPUT "${JEMALLOC_ROOT_DIR}/lib/libjemalloc_pic.a"
 				COMMAND make -j16
 				DEPENDS "${JEMALLOC_ROOT_DIR}/include/jemalloc/jemalloc.h"
@@ -165,7 +187,12 @@ if(CMAKE_COMPILER_IS_GNUCC)
 		set(JeMalloc_LIBRARIES ${JEMALLOC_ROOT_DIR}/lib/libjemalloc_pic.a)
 	endif()
 
-	list(APPEND SYS_LIBS "dl" "pthread" "rt")
+	# macOS does not have librt, need to handle separately
+	if(APPLE)
+		list(APPEND SYS_LIBS "dl" "pthread")
+	else()
+		list(APPEND SYS_LIBS "dl" "pthread" "rt")
+	endif()
 endif()
 
 # TODO(vinchen): in the future it should disable sync_ponit in production
@@ -207,12 +234,25 @@ set(RAPIDJSON_BUILD_TESTS OFF)
 set(RAPIDJSON_HAS_STDSTRING ON)
 add_subdirectory(src/thirdparty/rapidjson)
 add_subdirectory(src/thirdparty/lua)
+# # TODO: need to modify 
+if(CMAKE_COMPILER_IS_GNUCC)
+    set(WARN_MAYBE_UNINIT "-Wno-maybe-uninitialized")
+elseif(COMPILER_IS_CLANG)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-uninitialized -Wno-unused-but-set-variable")
+    # Add extra options for Clang to be compatible with third-party libraries (rocksdb)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-command-line-argument")
+endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-maybe-uninitialized") 
+if(CMAKE_COMPILER_IS_GNUCC OR COMPILER_IS_CLANG)
+if(CMAKE_COMPILER_IS_GNUCC)
+    set(WARN_MAYBE_UNINIT "-Wno-maybe-uninitialized")
+else()
+    set(WARN_MAYBE_UNINIT "-Wno-uninitialized")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-command-line-argument")
+endif()
 add_subdirectory(${ROCKSDB_DIR}/rocksdb EXCLUDE_FROM_ALL)
 target_compile_options(rocksdb PRIVATE -DLZ4)
 
-if(CMAKE_COMPILER_IS_GNUCC)
 set(WARN_C_CXX
 "-Wall \
 -Wextra \
@@ -245,13 +285,14 @@ set(WARN_C_CXX
 -Werror=switch \
 -Werror=type-limits \
 -Werror=uninitialized \
--Wno-maybe-uninitialized \
+${WARN_MAYBE_UNINIT} \
 -Werror=unused-function \
 -Werror=unused-label \
 -Werror=unused-result \
 -Werror=unused-value \
 -Werror=unused-variable \
--Werror=write-strings")
+-Werror=write-strings \
+-Wno-unused-but-set-variable")
 
 set(WARN_CXX_ONLY
 "-Wno-invalid-offsetof \
@@ -277,7 +318,7 @@ include_directories("${PROJECT_SOURCE_DIR}/src/tendisplus/include")
 
 # gflags
 include_directories("src/thirdparty/include/Windows/")
-ENDIF()
+endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${WARN_C_CXX} ${WARN_CXX_ONLY}")
 

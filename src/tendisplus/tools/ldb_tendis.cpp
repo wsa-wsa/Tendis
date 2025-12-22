@@ -2,6 +2,13 @@
 // Please refer to the license text that comes with this tendis open source
 // project for additional information.
 
+#ifdef __APPLE__
+#include <libkern/OSByteOrder.h>
+#define htobe64(x) OSSwapHostToBigInt64(x)
+#else
+#include <endian.h>
+#endif
+
 #include "rocksdb/ldb_tool.h"
 #include "rocksdb/utilities/ldb_cmd.h"
 #include "rocksdb/utilities/ttl/db_ttl_impl.h"

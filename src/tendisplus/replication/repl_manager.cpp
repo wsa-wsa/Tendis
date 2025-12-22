@@ -328,7 +328,11 @@ Status ReplManager::startup() {
 
   _isRunning.store(true, std::memory_order_relaxed);
   _controller = std::make_unique<std::thread>(std::move([this]() {
+#ifdef __APPLE__
+    pthread_setname_np("tx-repl-loop");
+#else
     pthread_setname_np(pthread_self(), "tx-repl-loop");
+#endif
     controlRoutine();
   }));
 
