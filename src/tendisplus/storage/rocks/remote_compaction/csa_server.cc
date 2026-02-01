@@ -86,9 +86,10 @@ class SharedFileSystemCache {
     // A new FileSystem needs to be created from URI
     // Use unified interface to create shared filesystem
     // Supports: nfs://, hdfs://, s3://, etc.
+    // CSA server uses pure URI mode (no local path mapping), so local_prefix is empty
     std::shared_ptr<rocksdb::FileSystem> shared_fs;
     rocksdb::Status status = rocksdb::CreateSharedFileSystem(
-      rocksdb::FileSystem::Default(), uri, &shared_fs);
+      rocksdb::FileSystem::Default(), uri, "" /* local_prefix */, &shared_fs);
     if (!status.ok() || !shared_fs) {
       std::cerr << "[FSCache] Failed to create shared filesystem from URI: "
                 << uri << ", error: " << status.ToString() << std::endl;

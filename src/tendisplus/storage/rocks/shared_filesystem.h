@@ -14,8 +14,14 @@ namespace ROCKSDB_NAMESPACE {
 
 // Unified interface for creating shared file systems
 // Supports: nfs://, hdfs://, s3://, etc.
+// @param base Base filesystem (usually FileSystem::Default())
+// @param uri Filesystem URI (e.g., "nfs://server/path", "hdfs://namenode/path")
+// @param local_prefix For path-matching mode (NFS only), the local path prefix
+//                     to map to shared storage. Empty string for URI mode.
+// @param result Output: the created shared filesystem
 Status CreateSharedFileSystem(const std::shared_ptr<FileSystem>& base,
                               const std::string& uri,
+                              const std::string& local_prefix,
                               std::shared_ptr<FileSystem>* result);
 
 // Create Env from shared file system URI

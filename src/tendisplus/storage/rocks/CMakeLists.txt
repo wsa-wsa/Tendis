@@ -82,26 +82,36 @@ if(NOT LIBNFS_FOUND)
         message(FATAL_ERROR "libnfs not found! Please install libnfs-dev or set LIBNFS_ROOT environment variable")
     endif()
 endif()
-add_library(nfs_fs STATIC nfs_filesystem.cc nfs_file.cc nfs_filesystem_simple.cc shared_filesystem.cc)
-# 添加头文件路径
+# NFS 具体实现库
+add_library(nfs_fs STATIC nfs_filesystem.cc nfs_file.cc)
 target_include_directories(nfs_fs
     PUBLIC
         ${LIBNFS_INCLUDE_DIRS}
 )
-
-# 链接 libnfs
 target_link_libraries(nfs_fs
     PUBLIC
         rocksdb
         ${LIBNFS_LIBRARIES}
 )
 
+# 共享文件系统接口层（独立静态库）
+add_library(shared_fs STATIC shared_filesystem.cc)
+target_link_libraries(shared_fs
+    PUBLIC
+        nfs_fs
+        rocksdb
+)
+
+# ============================================================================
+# Control Plane - CaaS-LSM Architecture (必须在 rocks_kvstore 之前定义)
+# ============================================================================
+add_subdirectory(remote_compaction/control_plane)
 
 foreach(_target csa_server)
     add_executable(${_target}
             "remote_compaction/${_target}.cc")
     add_dependencies(${_target} csa_grpc_proto)
-    add_dependencies(${_target} nfs_fs)
+    add_dependencies(${_target} shared_fs)
     target_link_libraries(${_target}
             #          compaction_service_helper
             csa_grpc_proto
@@ -110,7 +120,7 @@ foreach(_target csa_server)
             ${_PROTOBUF_LIBPROTOBUF}
             rocksdb
             lz4_static
-            nfs_fs
+            shared_fs
             )
 endforeach()
 
@@ -122,17 +132,18 @@ endforeach()
 # add_library(rocks_kvstore STATIC rocks_kvstore.cpp rocks_kvttlcompactfilter.cpp)
 # target_link_libraries(rocks_kvstore utils_common kvstore rocksdb record glog ${SYS_LIBS} snappy lz4_static)
 
-add_library(rocks_kvstore STATIC rocks_kvstore.cpp rocks_kvttlcompactfilter.cpp compaction_service.cc)
-target_link_libraries(rocks_kvstore utils_common kvstore rocksdb record glog ${SYS_LIBS} snappy lz4_static  csa_grpc_proto 
+add_library(rocks_kvstore STATIC rocks_kvstore.cpp rocks_kvttlcompactfilter.cpp compaction_service.cc remote_compaction/worker_manager.cc)
+target_link_libraries(rocks_kvstore utils_common kvstore rocksdb record glog ${SYS_LIBS} snappy lz4_static csa_grpc_proto 
+            shared_fs
+            control_plane_client
             ${_REFLECTION}
             ${_GRPC_GRPCPP}
             ${_PROTOBUF_LIBPROTOBUF}
-            nfs_fs
             )
 
 add_library(rocks_kvstore_for_test STATIC rocks_kvstore.cpp rocks_kvttlcompactfilter.cpp)
 target_compile_definitions(rocks_kvstore_for_test PRIVATE -DNO_VERSIONEP)
-target_link_libraries(rocks_kvstore_for_test utils_common kvstore rocksdb record glog ${SYS_LIBS} snappy lz4_static)
+target_link_libraries(rocks_kvstore_for_test utils_common kvstore rocksdb record glog ${SYS_LIBS} snappy lz4_static shared_fs)
 
 if(TENDIS_WITH_UNIT_TESTS)
 add_executable(rocks_kvstore_test rocks_kvstore_test.cpp)

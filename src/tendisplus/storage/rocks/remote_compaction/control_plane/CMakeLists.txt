@@ -1,0 +1,77 @@
+# Control Plane CMakeLists.txt
+# Based on CaaS-LSM architecture
+
+# Proto file for control plane
+get_filename_component(cp_proto "${CMAKE_CURRENT_SOURCE_DIR}/../protos/control_plane.proto" ABSOLUTE)
+get_filename_component(cp_proto_path "${cp_proto}" PATH)
+
+# Generated sources
+set(cp_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/control_plane.pb.cc")
+set(cp_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/control_plane.pb.h")
+set(cp_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/control_plane.grpc.pb.cc")
+set(cp_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/control_plane.grpc.pb.h")
+
+add_custom_command(
+    OUTPUT "${cp_proto_srcs}" "${cp_proto_hdrs}" "${cp_grpc_srcs}" "${cp_grpc_hdrs}"
+    COMMAND ${_PROTOBUF_PROTOC}
+    ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
+         --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
+         -I "${cp_proto_path}"
+         --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
+         "${cp_proto}"
+    DEPENDS "${cp_proto}")
+
+# Include generated *.pb.h files
+include_directories("${CMAKE_CURRENT_BINARY_DIR}")
+
+# Control plane proto library
+add_library(control_plane_grpc_proto
+    ${cp_grpc_srcs}
+    ${cp_grpc_hdrs}
+    ${cp_proto_srcs}
+    ${cp_proto_hdrs})
+target_link_libraries(control_plane_grpc_proto
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF})
+
+# Control plane core library
+add_library(control_plane_core STATIC
+    task_model.cc
+    worker_manager.cc
+    task_scheduler.cc
+    control_plane.cc)
+target_link_libraries(control_plane_core
+    control_plane_grpc_proto
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF})
+
+# Control plane server executable
+add_executable(control_plane_server
+    control_plane_server.cc)
+target_link_libraries(control_plane_server
+    control_plane_core
+    control_plane_grpc_proto
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF})
+
+# Control plane client library (for Tendisplus integration)
+add_library(control_plane_client STATIC
+    ../control_plane_client.cc)
+target_link_libraries(control_plane_client
+    control_plane_grpc_proto
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF})
+
+# Control plane worker library (for CSA worker integration)
+add_library(control_plane_worker STATIC
+    ../control_plane_worker.cc)
+target_link_libraries(control_plane_worker
+    control_plane_grpc_proto
+    rocksdb
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF})

@@ -40,7 +40,6 @@
 #include "tendisplus/server/server_params.h"
 #include "tendisplus/server/session.h"
 #include "tendisplus/storage/rocks/compaction_service.h"
-#include "tendisplus/storage/rocks/nfs_filesystem.h"
 #include "tendisplus/storage/rocks/rocks_kvttlcompactfilter.h"
 #include "tendisplus/storage/rocks/shared_filesystem.h"
 #include "tendisplus/storage/varint.h"
@@ -2244,7 +2243,28 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
     // Build RemoteOpenAndCompactOptions from configuration
     rocksdb::RemoteOpenAndCompactOptions remote_options;
 
-    // Read CSA address (required for remote compaction)
+    // =========================================================================
+    // CaaS-LSM Architecture: Control Plane (preferred)
+    // =========================================================================
+    // Read Control Plane address first (preferred over direct CSA)
+    if (gParams && !gParams->controlPlaneAddress.empty()) {
+      remote_options.control_plane_address = gParams->controlPlaneAddress;
+      // Basic validation: check if address contains ':'
+      if (remote_options.control_plane_address.find(':') == std::string::npos) {
+        LOG(WARNING) << "Invalid Control Plane address format: "
+                     << remote_options.control_plane_address
+                     << " (expected format: host:port), will try CSA fallback";
+        remote_options.control_plane_address.clear();
+      } else {
+        LOG(INFO) << "Control Plane address configured: "
+                  << remote_options.control_plane_address
+                  << " (CaaS-LSM architecture)";
+      }
+    }
+
+    // =========================================================================
+    // Legacy: Direct CSA connection (fallback when Control Plane not configured)
+    // =========================================================================
     if (gParams && !gParams->csaAddress.empty()) {
       remote_options.csa_address = gParams->csaAddress;
       // Basic validation: check if address contains ':'
@@ -2255,7 +2275,13 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
                         "be disabled";
         remote_options.csa_address.clear();
       } else {
-        LOG(INFO) << "CSA address configured: " << remote_options.csa_address;
+        if (remote_options.control_plane_address.empty()) {
+          LOG(INFO) << "CSA address configured (Legacy mode): "
+                    << remote_options.csa_address;
+        } else {
+          LOG(INFO) << "CSA address configured as fallback: "
+                    << remote_options.csa_address;
+        }
       }
     }
 
@@ -2305,38 +2331,13 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
       const std::string& shared_fs_uri = remote_options.shared_fs_uri;
       const std::string& local_prefix = remote_options.shared_fs_local_prefix;
 
-      // Try URI mode first (preferred for remote deployment and other
-      // filesystems)
-      if (shared_fs_uri.find("nfs://") == 0) {
-        // NFS: Try URI mode first, fallback to path matching if local_prefix
-        // provided
-        if (local_prefix.empty()) {
-          // Pure URI mode (recommended for remote deployment)
-          std::unique_ptr<rocksdb::FileSystem> fs;
-          fs_status = rocksdb::NFSFileSystem::Create(
-            rocksdb::FileSystem::Default(), shared_fs_uri, &fs);
-          if (fs_status.ok() && fs) {
-            _sharedFileSystem =
-              std::shared_ptr<rocksdb::FileSystem>(fs.release());
-            LOG(INFO) << "Shared FileSystem (NFS) created in URI mode (no "
-                         "local_prefix)";
-          }
-        } else {
-          // Path matching mode (backward compatibility)
-          fs_status = rocksdb::NewNFSFileSystem(
-            shared_fs_uri, local_prefix, &_sharedFileSystem);
-          if (fs_status.ok() && _sharedFileSystem) {
-            LOG(INFO)
-              << "Shared FileSystem (NFS) created in path matching mode";
-          }
-        }
-      } else {
-        // Other filesystems (HDFS, S3, etc.) - use unified interface
-        fs_status = rocksdb::CreateSharedFileSystem(
-          rocksdb::FileSystem::Default(), shared_fs_uri, &_sharedFileSystem);
-        if (fs_status.ok() && _sharedFileSystem) {
-          LOG(INFO) << "Shared filesystem created: " << shared_fs_uri;
-        }
+      // Use unified interface for all filesystem types
+      // CreateSharedFileSystem handles NFS/HDFS/S3/etc. internally
+      fs_status = rocksdb::CreateSharedFileSystem(
+        rocksdb::FileSystem::Default(), shared_fs_uri, local_prefix,
+        &_sharedFileSystem);
+      if (fs_status.ok() && _sharedFileSystem) {
+        LOG(INFO) << "Shared filesystem created: " << shared_fs_uri;
       }
 
       if (!fs_status.ok() || !_sharedFileSystem) {

@@ -14,7 +14,9 @@
 #include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
 
+#include "tendisplus/storage/rocks/remote_compaction/control_plane_client.h"
 #include "tendisplus/storage/rocks/remote_compaction/def.h"
+#include "tendisplus/storage/rocks/remote_compaction/worker_manager.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -37,7 +39,10 @@ class MyTestCompactionService : public CompactionService {
       listeners_(listeners),
       table_properties_collector_factories_(
         std::move(table_properties_collector_factories)),
-      remote_options_(remote_options) {}
+      remote_options_(remote_options) {
+    // 初始化远程 Compaction 支持
+    InitRemoteCompaction();
+  }
 
   static const char* kClassName() {
     return "MyTestCompactionService";
@@ -91,7 +96,53 @@ class MyTestCompactionService : public CompactionService {
     canceled_ = canceled;
   }
 
+  // 获取 WorkerManager（用于外部访问统计信息等）- Legacy mode
+  std::shared_ptr<tendisplus::remote_compaction::WorkerManager>
+  GetWorkerManager() const {
+    return worker_manager_;
+  }
+
+  // 更新 Worker 列表（动态配置）- Legacy mode
+  void UpdateWorkerList(const std::string& addresses);
+
+  // 获取当前使用的 CSA 地址（用于日志）
+  std::string GetCurrentCSAAddress() const;
+
+  // 检查是否使用 Control Plane 模式
+  bool IsUsingControlPlane() const {
+    return use_control_plane_;
+  }
+
  private:
+  // 初始化远程 Compaction（选择 Control Plane 或 Legacy 模式）
+  void InitRemoteCompaction();
+
+  // 初始化 Control Plane Client
+  void InitControlPlaneClient();
+
+  // 初始化 WorkerManager（Legacy 模式）
+  void InitWorkerManager();
+
+  // 选择 CSA 节点执行任务（Legacy 模式）
+  // 返回选中的 Worker 信息，如果没有可用节点返回 nullptr
+  std::shared_ptr<tendisplus::remote_compaction::WorkerInfo> SelectCSAWorker();
+
+  // =========================================================================
+  // Control Plane 模式 - 通过 Control Plane 提交任务
+  // =========================================================================
+  CompactionServiceJobStatus WaitForCompleteViaControlPlane(
+    const CompactionServiceJobInfo& info,
+    const std::string& compaction_input,
+    std::string* compaction_service_result);
+
+  // =========================================================================
+  // Legacy 模式 - 直接连接 CSA Server
+  // =========================================================================
+  CompactionServiceJobStatus WaitForCompleteViaDirectCSA(
+    const CompactionServiceJobInfo& info,
+    const std::string& compaction_input,
+    std::string* compaction_service_result);
+
   InstrumentedMutex mutex_;
   std::atomic_int compaction_num_{0};
   std::map<uint64_t, std::string> jobs_;
@@ -115,5 +166,17 @@ class MyTestCompactionService : public CompactionService {
 
   // Remote compaction configuration (all settings from config file)
   RemoteOpenAndCompactOptions remote_options_;
+
+  // =========================================================================
+  // Control Plane 模式
+  // =========================================================================
+  bool use_control_plane_ = false;
+  std::unique_ptr<tendisplus::remote_compaction::ControlPlaneClient>
+    control_plane_client_;
+
+  // =========================================================================
+  // Legacy 模式 - Worker Manager for multi-node support
+  // =========================================================================
+  std::shared_ptr<tendisplus::remote_compaction::WorkerManager> worker_manager_;
 };
 }  // namespace ROCKSDB_NAMESPACE

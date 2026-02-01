@@ -21,6 +21,7 @@ namespace ROCKSDB_NAMESPACE {
 
 Status CreateSharedFileSystem(const std::shared_ptr<FileSystem>& base,
                               const std::string& uri,
+                              const std::string& local_prefix,
                               std::shared_ptr<FileSystem>* result) {
   result->reset();
 
@@ -30,13 +31,22 @@ Status CreateSharedFileSystem(const std::shared_ptr<FileSystem>& base,
 
   // Determine filesystem type from URI scheme
   if (uri.find("nfs://") == 0) {
-    // NFS filesystem
-    std::unique_ptr<FileSystem> nfs_fs;
-    Status s = NFSFileSystem::Create(base, uri, &nfs_fs);
-    if (!s.ok()) {
-      return s;
+    // NFS filesystem - supports both URI mode and path matching mode
+    if (local_prefix.empty()) {
+      // Pure URI mode (recommended for remote deployment)
+      std::unique_ptr<FileSystem> nfs_fs;
+      Status s = NFSFileSystem::Create(base, uri, &nfs_fs);
+      if (!s.ok()) {
+        return s;
+      }
+      result->reset(nfs_fs.release());
+    } else {
+      // Path matching mode (backward compatibility)
+      Status s = NewNFSFileSystem(uri, local_prefix, result);
+      if (!s.ok()) {
+        return s;
+      }
     }
-    result->reset(nfs_fs.release());
     return Status::OK();
   }
 #ifdef HDFS
@@ -60,7 +70,7 @@ Status CreateSharedFileSystemEnv(const std::string& uri,
   result->reset();
 
   std::shared_ptr<FileSystem> fs;
-  Status s = CreateSharedFileSystem(FileSystem::Default(), uri, &fs);
+  Status s = CreateSharedFileSystem(FileSystem::Default(), uri, "", &fs);
   if (!s.ok()) {
     return s;
   }

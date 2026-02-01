@@ -23,9 +23,21 @@ struct RemoteOpenAndCompactOptions : public OpenAndCompactOptions {
   // Allows cancellation of an in-progress compaction.
   std::atomic<bool>* canceled = nullptr;
 
+  // =========================================================================
+  // CaaS-LSM Architecture: Control Plane based (preferred)
+  // =========================================================================
+  // Control Plane address - Tendisplus connects to Control Plane,
+  // which manages and distributes tasks to multiple CSA workers
+  // If set, CSA tasks are submitted through Control Plane
+  std::string control_plane_address;
+
+  // =========================================================================
+  // Legacy: Direct CSA connection (deprecated, for backward compatibility)
+  // =========================================================================
   // CSA server address (empty means disabled)
-  // Should be set from configuration, e.g., "localhost:8010" or
-  // "192.168.1.100:8010"
+  // Supports multiple addresses separated by comma for multi-node setup
+  // e.g., "host1:8010,host2:8010,host3:8010"
+  // Only used when control_plane_address is empty
   std::string csa_address;
 
   // Shared FileSystem configuration (supports NFS, HDFS, S3, etc.)
@@ -45,6 +57,16 @@ struct RemoteOpenAndCompactOptions : public OpenAndCompactOptions {
   int64_t grpc_max_message_size = 0;  // Max gRPC message size (0 = use default)
   int32_t check_time_interval = 0;    // Check time interval (0 = use default)
   uint64_t max_reschedule = 0;        // Max reschedule times (0 = use default)
+
+  // Multi-node load balancing configuration
+  // Supported policies: "round_robin", "least_loaded", "random",
+  // "weighted_random"
+  std::string load_balance_policy = "least_loaded";
+
+  // Health check configuration for multi-node
+  int32_t health_check_interval_sec = 10;   // Health check interval
+  int32_t health_check_timeout_ms = 3000;   // Health check timeout
+  int32_t max_consecutive_failures = 3;     // Max failures before marking offline
 
   // Helper methods to get values with defaults
   int64_t GetMaxConcurrentTasks() const {

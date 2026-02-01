@@ -621,7 +621,10 @@ ServerParams::ServerParams() {
   REGISTER_VARS_DIFF_NAME_DYNAMIC("enable-move-pubsub-request",
                                   enableMovePubSubRequest);
 
-  // Remote Compaction Service (CSA) Configuration
+  // Remote Compaction Service Configuration
+  // Control Plane address (CaaS-LSM architecture - preferred)
+  REGISTER_VARS_DIFF_NAME("control_plane_address", controlPlaneAddress);
+  // Legacy: Direct CSA address (deprecated, use control_plane_address instead)
   REGISTER_VARS_DIFF_NAME("csa_address", csaAddress);
   // Note: remote_compaction.mode removed - only shared_storage mode is
   // supported
@@ -641,6 +644,16 @@ ServerParams::ServerParams() {
                           remoteCompactionCheckTimeInterval);
   REGISTER_VARS_DIFF_NAME("remote_compaction.max_reschedule",
                           remoteCompactionMaxReschedule);
+
+  // Multi-node Load Balancing Configuration
+  REGISTER_VARS_DIFF_NAME("remote_compaction.load_balance_policy",
+                          remoteCompactionLoadBalancePolicy);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.health_check_interval_sec",
+                          remoteCompactionHealthCheckIntervalSec);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.health_check_timeout_ms",
+                          remoteCompactionHealthCheckTimeoutMs);
+  REGISTER_VARS_DIFF_NAME("remote_compaction.max_consecutive_failures",
+                          remoteCompactionMaxConsecutiveFailures);
 }
 
 ServerParams::~ServerParams() {

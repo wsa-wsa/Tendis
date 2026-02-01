@@ -645,9 +645,16 @@ class ServerParams {
   bool enableClosePubSubConnection = true;
   bool enableMovePubSubRequest = true;
 
-  // Remote Compaction Service (CSA) Configuration
+  // Remote Compaction Service Configuration
+  // Control Plane address (CaaS-LSM architecture)
+  // Tendisplus connects to Control Plane, which manages multiple CSA workers
+  std::string controlPlaneAddress = "";  // Control Plane address (host:port)
+
+  // Legacy: Direct CSA address (deprecated, use controlPlaneAddress instead)
+  // Only used as fallback when controlPlaneAddress is empty
   std::string csaAddress =
-    "";  // CSA server address (host:port), e.g., "localhost:8010"
+    "";  // CSA server address (host:port), supports multiple addresses
+         // separated by comma, e.g., "host1:8010,host2:8010,host3:8010"
   // Note: remote compaction only supports shared_storage mode (no configuration
   // needed)
 
@@ -660,13 +667,27 @@ class ServerParams {
 
   // Remote Compaction Advanced Settings
   int64_t remoteCompactionMaxConcurrentTasks =
-    0;  // Max concurrent compaction tasks (0 = use default)
+    0;  // Max concurrent compaction tasks per worker (0 = use default)
   int64_t remoteCompactionGrpcMaxMessageSize =
     0;  // Max gRPC message size in bytes (0 = use default 16MB)
   int32_t remoteCompactionCheckTimeInterval =
     0;  // Check time interval in seconds (0 = use default)
   uint64_t remoteCompactionMaxReschedule =
     0;  // Max reschedule times (0 = use default)
+
+  // Load balancing configuration for multi-node CSA
+  // Supported policies: "round_robin", "least_loaded", "random",
+  // "weighted_random"
+  std::string remoteCompactionLoadBalancePolicy =
+    "least_loaded";  // Default: least_loaded
+
+  // Health check configuration
+  int32_t remoteCompactionHealthCheckIntervalSec =
+    10;  // Health check interval in seconds
+  int32_t remoteCompactionHealthCheckTimeoutMs =
+    3000;  // Health check timeout in milliseconds
+  int32_t remoteCompactionMaxConsecutiveFailures =
+    3;  // Max consecutive failures before marking worker offline
 };
 
 extern std::shared_ptr<tendisplus::ServerParams> gParams;

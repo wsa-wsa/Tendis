@@ -22,8 +22,20 @@
 #include "glog/logging.h"
 #include "rocksdb/db/compaction/compaction_job.h"
 
+#include "tendisplus/storage/rocks/remote_compaction/control_plane_client.h"
 #include "tendisplus/storage/rocks/remote_compaction/def.h"
+#include "tendisplus/storage/rocks/remote_compaction/worker_manager.h"
 #include "tendisplus/storage/rocks/shared_filesystem.h"
+
+using tendisplus::remote_compaction::ControlPlaneClient;
+using tendisplus::remote_compaction::ControlPlaneClientConfig;
+using tendisplus::remote_compaction::LoadBalancePolicy;
+using tendisplus::remote_compaction::RemoteTaskStatus;
+using tendisplus::remote_compaction::SubmitResult;
+using tendisplus::remote_compaction::TaskResultInfo;
+using tendisplus::remote_compaction::WorkerInfo;
+using tendisplus::remote_compaction::WorkerManager;
+using tendisplus::remote_compaction::WorkerManagerConfig;
 
 // Note: Max gRPC message size is now configurable via
 // remote_options_.GetGrpcMaxMessageSize() Default is 16MB, but can be
@@ -206,11 +218,19 @@ CompactionServiceJobStatus MyTestCompactionService::StartV2(
             << std::endl;
   std::cerr << "[CompactionService] Job ID: " << info.job_id << std::endl;
   std::cerr << "[CompactionService] DB Path: " << db_path_ << std::endl;
-  std::cerr << "[CompactionService] CSA Address: "
-            << (remote_options_.csa_address.empty()
-                  ? "(NOT CONFIGURED!)"
-                  : remote_options_.csa_address)
+  std::cerr << "[CompactionService] Mode: "
+            << (use_control_plane_ ? "Control Plane" : "Legacy (Direct CSA)")
             << std::endl;
+  if (use_control_plane_) {
+    std::cerr << "[CompactionService] Control Plane Address: "
+              << remote_options_.control_plane_address << std::endl;
+  } else {
+    std::cerr << "[CompactionService] CSA Address: "
+              << (remote_options_.csa_address.empty()
+                    ? "(NOT CONFIGURED!)"
+                    : remote_options_.csa_address)
+              << std::endl;
+  }
   std::cerr << "[CompactionService] Shared FS URI: "
             << (remote_options_.shared_fs_uri.empty()
                   ? "(NOT CONFIGURED!)"
@@ -249,6 +269,156 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
     return override_wait_status_;
   }
 
+  std::cerr
+    << "[CompactionService] ========== WaitForCompleteV2 CALLED =========="
+    << std::endl;
+  std::cerr << "[CompactionService] Job ID: " << info.job_id << std::endl;
+  std::cerr << "[CompactionService] Mode: "
+            << (use_control_plane_ ? "Control Plane" : "Legacy (Direct CSA)")
+            << std::endl;
+  std::cerr.flush();
+
+  // 根据模式选择执行路径
+  if (use_control_plane_) {
+    return WaitForCompleteViaControlPlane(info, compaction_input,
+                                          compaction_service_result);
+  } else {
+    return WaitForCompleteViaDirectCSA(info, compaction_input,
+                                       compaction_service_result);
+  }
+}
+
+// ============================================================================
+// Control Plane Mode - 通过控制平面提交任务
+// ============================================================================
+CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteViaControlPlane(
+  const CompactionServiceJobInfo& info,
+  const std::string& compaction_input,
+  std::string* compaction_service_result) {
+
+  std::string job_id = std::to_string(info.job_id);
+
+  std::cerr << "[CompactionService] Using Control Plane mode" << std::endl;
+  std::cerr << "[CompactionService] Control Plane: "
+            << remote_options_.control_plane_address << std::endl;
+  std::cerr.flush();
+
+  if (!control_plane_client_ || !control_plane_client_->IsConnected()) {
+    std::cerr << "[CompactionService] Control Plane not connected, "
+              << "falling back to local compaction" << std::endl;
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+
+  // 构建 URI
+  std::string db_path_uri;
+  if (!remote_options_.shared_fs_uri.empty() &&
+      IsSharedFilesystemURI(remote_options_.shared_fs_uri)) {
+    db_path_uri = ConvertLocalPathToSharedURI(
+      db_path_,
+      remote_options_.shared_fs_uri,
+      remote_options_.shared_fs_local_prefix);
+  } else {
+    db_path_uri = ToAbsolutePath(db_path_);
+  }
+
+  // 构建源节点 ID（用于任务追踪）
+  // TODO: 从 ServerParams 获取实际的 bind:port
+  std::string source_node_id = "tendisplus:" + db_path_;
+
+  // 提交任务到 Control Plane
+  std::cerr << "[CompactionService] Submitting task to Control Plane..."
+            << std::endl;
+  std::cerr << "[CompactionService] DB Path URI: " << db_path_uri << std::endl;
+  std::cerr << "[CompactionService] Shared FS URI: "
+            << remote_options_.shared_fs_uri << std::endl;
+  std::cerr.flush();
+
+  SubmitResult submit_result = control_plane_client_->SubmitCompactionTask(
+    source_node_id,
+    db_path_uri,
+    0,  // store_id - TODO: 从 info 获取
+    info.job_id,
+    compaction_input,
+    remote_options_.shared_fs_uri,
+    1   // priority: normal
+  );
+
+  if (!submit_result.success) {
+    std::cerr << "[CompactionService] Failed to submit task to Control Plane: "
+              << submit_result.error_message << std::endl;
+    std::cerr << "[CompactionService] Falling back to local compaction"
+              << std::endl;
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+
+  std::cerr << "[CompactionService] Task submitted successfully, task_id: "
+            << submit_result.task_id << std::endl;
+  std::cerr << "[CompactionService] Waiting for task result..." << std::endl;
+  std::cerr.flush();
+
+  // 等待任务完成
+  TaskResultInfo task_result = control_plane_client_->WaitForTaskResult(
+    submit_result.task_id,
+    60000  // 60 seconds timeout
+  );
+
+  if (is_override_wait_result_) {
+    *compaction_service_result = override_wait_result_;
+  }
+  compaction_num_.fetch_add(1);
+
+  if (!task_result.completed) {
+    std::cerr << "[CompactionService] Task not completed within timeout"
+              << std::endl;
+
+    // 检查任务状态
+    if (task_result.status == RemoteTaskStatus::kTimeout ||
+        task_result.status == RemoteTaskStatus::kCancelled) {
+      std::cerr << "[CompactionService] Task was cancelled or timed out, "
+                << "falling back to local compaction" << std::endl;
+      return CompactionServiceJobStatus::kUseLocal;
+    }
+
+    // 其他情况也回退到本地
+    std::cerr << "[CompactionService] Task status: "
+              << static_cast<int>(task_result.status)
+              << ", falling back to local compaction" << std::endl;
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+
+  // 任务完成
+  if (task_result.status == RemoteTaskStatus::kCompleted) {
+    *compaction_service_result = task_result.compaction_result;
+    std::cerr << "[CompactionService] Task completed successfully, result size: "
+              << compaction_service_result->size() << " bytes" << std::endl;
+    LOG(INFO) << "[CompactionService] Control Plane task completed: "
+              << submit_result.task_id
+              << ", result_size=" << compaction_service_result->size();
+    return CompactionServiceJobStatus::kSuccess;
+  } else if (task_result.status == RemoteTaskStatus::kFailed) {
+    std::cerr << "[CompactionService] Task failed: "
+              << task_result.error_message << std::endl;
+    LOG(WARNING) << "[CompactionService] Control Plane task failed: "
+                 << submit_result.task_id << ", error: "
+                 << task_result.error_message;
+    // 任务失败，回退到本地
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+
+  // 未知状态
+  std::cerr << "[CompactionService] Unknown task status: "
+            << static_cast<int>(task_result.status) << std::endl;
+  return CompactionServiceJobStatus::kUseLocal;
+}
+
+// ============================================================================
+// Legacy Mode - 直接连接 CSA Server
+// ============================================================================
+CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteViaDirectCSA(
+  const CompactionServiceJobInfo& info,
+  const std::string& compaction_input,
+  std::string* compaction_service_result) {
+
   CompactionServiceOptionsOverride options_override;
   // CRITICAL: Always use the same env as the main DB to ensure consistency
   // If NFS is enabled, this will be NFS env, ensuring all compaction (remote or
@@ -278,11 +448,7 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
   std::string job_id = std::to_string(info.job_id);
   std::string output_dir = db_path_ + "/" + job_id;
 
-  std::cerr
-    << "[CompactionService] ========== WaitForCompleteV2 CALLED =========="
-    << std::endl;
-  std::cerr << "[CompactionService] Job ID: " << job_id << std::endl;
-  std::cerr << "[CompactionService] DB Path: " << db_path_ << std::endl;
+  std::cerr << "[CompactionService] Using Legacy (Direct CSA) mode" << std::endl;
   std::cerr << "[CompactionService] CSA Address: "
             << (remote_options_.csa_address.empty()
                   ? "(NOT CONFIGURED!)"
@@ -293,11 +459,6 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
                   ? "(NOT CONFIGURED!)"
                   : remote_options_.shared_fs_uri)
             << std::endl;
-  std::cerr << "[CompactionService] Input size: " << compaction_input.size()
-            << " bytes" << std::endl;
-  std::cerr
-    << "[CompactionService] ==============================================="
-    << std::endl;
   std::cerr.flush();
 
   // Check if NFS is enabled (for consistency, all compaction must use NFS if
@@ -306,7 +467,7 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
     !remote_options_.shared_fs_local_prefix.empty();
 
   // Check if remote compaction is enabled (CSA address must be configured)
-  if (remote_options_.csa_address.empty()) {
+  if (remote_options_.csa_address.empty() && !worker_manager_) {
     std::cerr << "[CompactionService] ERROR: CSA address is EMPTY! "
               << "Remote compaction will NOT be used. "
               << "Please configure csa_address in config file." << std::endl;
@@ -323,49 +484,80 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
     return CompactionServiceJobStatus::kUseLocal;
   }
 
-  // Validate CSA address format (basic check: should contain ':')
-  if (remote_options_.csa_address.find(':') == std::string::npos) {
-    if (nfs_enabled) {
-      std::cerr << "[CompactionService] Invalid CSA address format: "
-                << remote_options_.csa_address
-                << " (expected format: host:port), falling back to local "
-                   "compaction (using NFS for consistency)"
-                << std::endl;
-    } else {
-      std::cerr
-        << "[CompactionService] Invalid CSA address format: "
-        << remote_options_.csa_address
-        << " (expected format: host:port), falling back to local compaction"
-        << std::endl;
+  // =========================================================================
+  // Multi-node support: Select CSA worker using WorkerManager
+  // =========================================================================
+  std::shared_ptr<grpc::Channel> channel;
+  std::string selected_csa_address;
+  std::shared_ptr<WorkerInfo> selected_worker;
+
+  if (worker_manager_) {
+    // Use WorkerManager to select the best available worker
+    selected_worker = SelectCSAWorker();
+    if (!selected_worker) {
+      std::cerr << "[CompactionService] No available CSA worker, "
+                << "falling back to local compaction" << std::endl;
+      return CompactionServiceJobStatus::kUseLocal;
     }
-    // Return kUseLocal - RocksDB will use options_override.env which is NFS env
-    // if NFS is enabled
-    return CompactionServiceJobStatus::kUseLocal;
+
+    selected_csa_address = selected_worker->address;
+    channel = selected_worker->channel;
+
+    // Notify WorkerManager that we're assigning a task
+    worker_manager_->OnTaskAssigned(selected_worker->worker_id);
+
+    std::cerr << "[CompactionService] Using WorkerManager, selected: "
+              << selected_csa_address << " (workers online: "
+              << worker_manager_->GetOnlineWorkerCount() << "/"
+              << worker_manager_->GetWorkerCount() << ")" << std::endl;
+  } else {
+    // Fallback to single-node mode (backward compatibility)
+    // Validate CSA address format (basic check: should contain ':')
+    if (remote_options_.csa_address.find(':') == std::string::npos) {
+      if (nfs_enabled) {
+        std::cerr << "[CompactionService] Invalid CSA address format: "
+                  << remote_options_.csa_address
+                  << " (expected format: host:port), falling back to local "
+                     "compaction (using NFS for consistency)"
+                  << std::endl;
+      } else {
+        std::cerr
+          << "[CompactionService] Invalid CSA address format: "
+          << remote_options_.csa_address
+          << " (expected format: host:port), falling back to local compaction"
+          << std::endl;
+      }
+      return CompactionServiceJobStatus::kUseLocal;
+    }
+
+    selected_csa_address = remote_options_.csa_address;
+
+    // Create channel with configured message size limit
+    int64_t max_msg_size = remote_options_.GetGrpcMaxMessageSize();
+    std::cerr << "[CompactionService] Creating gRPC channel to "
+              << selected_csa_address
+              << " with max message size: " << max_msg_size << " bytes"
+              << std::endl;
+    std::cerr.flush();
+
+    grpc::ChannelArguments channel_args;
+    channel_args.SetMaxReceiveMessageSize(static_cast<int>(max_msg_size));
+    channel_args.SetMaxSendMessageSize(static_cast<int>(max_msg_size));
+
+    channel = grpc::CreateCustomChannel(selected_csa_address,
+                                        grpc::InsecureChannelCredentials(),
+                                        channel_args);
   }
-
-  // Create channel with configured message size limit
-  int64_t max_msg_size = remote_options_.GetGrpcMaxMessageSize();
-  std::cerr << "[CompactionService] Creating gRPC channel to "
-            << remote_options_.csa_address
-            << " with max message size: " << max_msg_size << " bytes"
-            << std::endl;
-  std::cerr.flush();
-
-  grpc::ChannelArguments channel_args;
-  channel_args.SetMaxReceiveMessageSize(static_cast<int>(max_msg_size));
-  channel_args.SetMaxSendMessageSize(static_cast<int>(max_msg_size));
-
-  auto channel = grpc::CreateCustomChannel(remote_options_.csa_address,
-                                           grpc::InsecureChannelCredentials(),
-                                           channel_args);
 
   if (!channel) {
     std::cerr << "[CompactionService] ERROR: Failed to create gRPC channel to "
-              << remote_options_.csa_address
+              << selected_csa_address
               << ", falling back to local compaction" << std::endl;
     std::cerr.flush();
-    // Return kUseLocal - RocksDB will use options_override.env which is NFS env
-    // if NFS is enabled
+    // Notify failure if using WorkerManager
+    if (worker_manager_ && selected_worker) {
+      worker_manager_->OnTaskCompleted(selected_worker->worker_id, false);
+    }
     return CompactionServiceJobStatus::kUseLocal;
   }
 
@@ -382,7 +574,7 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
     << "[CompactionService] ========== Using REMOTE COMPACTION =========="
     << std::endl;
   std::cerr << "[CompactionService] Job ID: " << job_id << std::endl;
-  std::cerr << "[CompactionService] CSA Server: " << remote_options_.csa_address
+  std::cerr << "[CompactionService] CSA Server: " << selected_csa_address
             << std::endl;
   std::cerr << "[CompactionService] Shared FS URI: "
             << remote_options_.shared_fs_uri << std::endl;
@@ -483,6 +675,10 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
             << ", result_size=" << compaction_service_result->size();
 
   if (s.ok()) {
+    // Notify WorkerManager of successful completion
+    if (worker_manager_ && selected_worker) {
+      worker_manager_->OnTaskCompleted(selected_worker->worker_id, true);
+    }
     return CompactionServiceJobStatus::kSuccess;
   } else {
     std::string err_msg = s.ToString();
@@ -496,6 +692,11 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
     if (s.IsBusy()) {
       LOG(INFO) << "[CompactionService] CSA server busy, falling back to local "
                    "compaction";
+      // Mark worker as busy and notify failure
+      if (worker_manager_ && selected_worker) {
+        worker_manager_->MarkWorkerBusy(selected_worker->worker_id);
+        worker_manager_->OnTaskCompleted(selected_worker->worker_id, false);
+      }
       return CompactionServiceJobStatus::kUseLocal;
     }
 
@@ -504,6 +705,10 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
     if (s.IsNotFound()) {
       LOG(INFO) << "[CompactionService] Early stale task detection by CSA, "
                 << "constructing empty result and returning kSuccess";
+      // Still counts as successful from worker perspective
+      if (worker_manager_ && selected_worker) {
+        worker_manager_->OnTaskCompleted(selected_worker->worker_id, true);
+      }
       CompactionServiceResult empty_result;
       empty_result.status = Status::OK();
       empty_result.Write(compaction_service_result);
@@ -528,10 +733,19 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
       // result
       LOG(WARNING) << "[CompactionService] File not found (stale task), "
                    << "constructing empty result and returning kSuccess";
+      // Still counts as successful from worker perspective
+      if (worker_manager_ && selected_worker) {
+        worker_manager_->OnTaskCompleted(selected_worker->worker_id, true);
+      }
       CompactionServiceResult empty_result;
       empty_result.status = Status::OK();
       empty_result.Write(compaction_service_result);
       return CompactionServiceJobStatus::kSuccess;
+    }
+
+    // Notify WorkerManager of failure
+    if (worker_manager_ && selected_worker) {
+      worker_manager_->OnTaskCompleted(selected_worker->worker_id, false);
     }
 
     if (is_connection_error) {
@@ -551,4 +765,151 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
     return CompactionServiceJobStatus::kUseLocal;
   }
 }
+
+// ============================================================================
+// Initialization methods
+// ============================================================================
+
+void MyTestCompactionService::InitRemoteCompaction() {
+  // 优先使用 Control Plane 模式
+  if (!remote_options_.control_plane_address.empty()) {
+    use_control_plane_ = true;
+    InitControlPlaneClient();
+    std::cout << "[CompactionService] Using Control Plane mode: "
+              << remote_options_.control_plane_address << std::endl;
+    return;
+  }
+
+  // 回退到 Legacy 模式（直连 CSA）
+  if (!remote_options_.csa_address.empty()) {
+    use_control_plane_ = false;
+    InitWorkerManager();
+    std::cout << "[CompactionService] Using Legacy (Direct CSA) mode: "
+              << remote_options_.csa_address << std::endl;
+    return;
+  }
+
+  std::cout << "[CompactionService] Remote compaction not configured "
+            << "(no control_plane_address or csa_address)" << std::endl;
+}
+
+void MyTestCompactionService::InitControlPlaneClient() {
+  if (remote_options_.control_plane_address.empty()) {
+    std::cout << "[CompactionService] Control Plane address not configured"
+              << std::endl;
+    return;
+  }
+
+  ControlPlaneClientConfig config;
+  config.control_plane_address = remote_options_.control_plane_address;
+  config.grpc_max_message_size = remote_options_.GetGrpcMaxMessageSize();
+  config.request_timeout_ms = 30000;
+  config.wait_result_timeout_ms = 60000;
+
+  control_plane_client_ = std::make_unique<ControlPlaneClient>(config);
+
+  if (control_plane_client_->Connect()) {
+    std::cout << "[CompactionService] Connected to Control Plane: "
+              << remote_options_.control_plane_address << std::endl;
+
+    // 打印集群状态
+    auto status = control_plane_client_->GetClusterStatus();
+    std::cout << "[CompactionService] Cluster status: "
+              << status.online_workers << "/" << status.total_workers
+              << " workers online, "
+              << status.pending_tasks << " pending, "
+              << status.running_tasks << " running" << std::endl;
+  } else {
+    std::cerr << "[CompactionService] Failed to connect to Control Plane: "
+              << remote_options_.control_plane_address << std::endl;
+    // 连接失败时不回退，让后续请求再尝试连接
+  }
+}
+
+void MyTestCompactionService::InitWorkerManager() {
+  // 检查是否配置了 CSA 地址
+  if (remote_options_.csa_address.empty()) {
+    std::cout << "[CompactionService] No CSA address configured, "
+              << "WorkerManager not initialized" << std::endl;
+    return;
+  }
+
+  // 创建 WorkerManager 配置
+  WorkerManagerConfig config;
+  config.worker_addresses = remote_options_.csa_address;
+  config.default_max_concurrent = remote_options_.GetMaxConcurrentTasks();
+  config.grpc_max_message_size = remote_options_.GetGrpcMaxMessageSize();
+
+  // 设置健康检查配置
+  config.health_check_interval_sec = remote_options_.health_check_interval_sec;
+  config.health_check_timeout_ms = remote_options_.health_check_timeout_ms;
+  config.max_consecutive_failures = remote_options_.max_consecutive_failures;
+
+  // 根据配置选择负载均衡策略
+  std::string policy = remote_options_.load_balance_policy;
+  if (policy == "round_robin") {
+    config.load_balance_policy = LoadBalancePolicy::kRoundRobin;
+  } else if (policy == "least_loaded") {
+    config.load_balance_policy = LoadBalancePolicy::kLeastLoaded;
+  } else if (policy == "random") {
+    config.load_balance_policy = LoadBalancePolicy::kRandom;
+  } else if (policy == "weighted_random") {
+    config.load_balance_policy = LoadBalancePolicy::kWeightedRandom;
+  } else {
+    // 默认使用最小负载策略
+    config.load_balance_policy = LoadBalancePolicy::kLeastLoaded;
+  }
+
+  // 创建并启动 WorkerManager
+  worker_manager_ = std::make_shared<WorkerManager>(config);
+  worker_manager_->Start();
+
+  std::cout << "[CompactionService] WorkerManager initialized with "
+            << worker_manager_->GetWorkerCount() << " workers, "
+            << "policy: " << LoadBalancePolicyToString(config.load_balance_policy)
+            << std::endl;
+}
+
+std::shared_ptr<WorkerInfo> MyTestCompactionService::SelectCSAWorker() {
+  if (!worker_manager_) {
+    return nullptr;
+  }
+
+  // 使用负载均衡选择 Worker
+  auto worker = worker_manager_->SelectWorker();
+  if (worker) {
+    std::cout << "[CompactionService] Selected worker: " << worker->address
+              << " (load: " << (worker->LoadRatio() * 100) << "%)" << std::endl;
+  }
+  return worker;
+}
+
+void MyTestCompactionService::UpdateWorkerList(const std::string& addresses) {
+  if (worker_manager_) {
+    worker_manager_->UpdateWorkerList(addresses);
+  } else {
+    // 如果还没有 WorkerManager，创建一个
+    remote_options_.csa_address = addresses;
+    InitWorkerManager();
+  }
+}
+
+std::string MyTestCompactionService::GetCurrentCSAAddress() const {
+  if (use_control_plane_) {
+    return "ControlPlane:" + remote_options_.control_plane_address;
+  }
+
+  if (worker_manager_) {
+    auto workers = worker_manager_->GetAllWorkers();
+    std::string result;
+    for (const auto& w : workers) {
+      if (!result.empty())
+        result += ",";
+      result += w->address;
+    }
+    return result;
+  }
+  return remote_options_.csa_address;
+}
+
 }  // namespace ROCKSDB_NAMESPACE

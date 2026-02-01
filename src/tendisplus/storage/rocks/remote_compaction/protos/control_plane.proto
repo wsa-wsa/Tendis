@@ -1,0 +1,392 @@
+// Copyright (C) 2020 THL A29 Limited, a Tencent company.  All rights reserved.
+// Please refer to the license text that comes with this tendis open source
+// project for additional information.
+
+// Control Plane gRPC Service Definition
+// Based on CaaS-LSM architecture: Compaction-as-a-Service
+
+syntax = "proto3";
+
+package control_plane;
+
+// ============================================================================
+// Control Plane Service - 控制平面服务
+// Tendisplus 节点通过此服务提交 compaction 任务
+// CSA Worker 通过此服务注册和上报结果
+// ============================================================================
+service ControlPlaneService {
+  // =========================================================================
+  // Tendisplus Node API - DB节点调用的接口
+  // =========================================================================
+  
+  // 提交 Compaction 任务
+  rpc SubmitCompactionTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  
+  // 查询任务状态
+  rpc QueryTaskStatus(QueryTaskRequest) returns (QueryTaskResponse);
+  
+  // 取消任务
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+  
+  // 获取任务结果 (阻塞等待或立即返回)
+  rpc WaitForTaskResult(WaitResultRequest) returns (WaitResultResponse);
+
+  // =========================================================================
+  // CSA Worker API - Worker节点调用的接口
+  // =========================================================================
+  
+  // Worker 注册
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  
+  // Worker 心跳
+  rpc WorkerHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // Worker 注销
+  rpc UnregisterWorker(UnregisterWorkerRequest) returns (UnregisterWorkerResponse);
+  
+  // 上报任务结果
+  rpc ReportTaskResult(TaskResultRequest) returns (TaskResultResponse);
+  
+  // 获取待执行任务 (Worker 拉取模式)
+  rpc FetchTask(FetchTaskRequest) returns (FetchTaskResponse);
+
+  // =========================================================================
+  // Admin API - 管理接口
+  // =========================================================================
+  
+  // 获取集群状态
+  rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  
+  // 获取 Worker 列表
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+  
+  // 获取任务统计
+  rpc GetTaskStatistics(TaskStatisticsRequest) returns (TaskStatisticsResponse);
+}
+
+// ============================================================================
+// CaaS-LSM: CSA Service - CSA Worker 暴露的服务接口
+// 控制平面通过此服务主动推送任务给 CSA (推送模式)
+// ============================================================================
+service CSAService {
+  // 分发 Compaction 任务 (CaaS-LSM 推送模式)
+  rpc DistributeCompactionJob(DistributeJobRequest) returns (DistributeJobResponse);
+  
+  // 检查 CSA 状态
+  rpc CheckCSAStatus(CSAStatusRequest) returns (CSAStatusResponse);
+  
+  // 取消正在执行的任务
+  rpc CancelRunningTask(CancelRunningTaskRequest) returns (CancelRunningTaskResponse);
+}
+
+// ============================================================================
+// Common Types - 公共类型定义
+// ============================================================================
+
+// 任务优先级
+enum TaskPriority {
+  PRIORITY_LOW = 0;
+  PRIORITY_NORMAL = 1;
+  PRIORITY_HIGH = 2;
+  PRIORITY_URGENT = 3;
+}
+
+// 任务状态
+enum TaskStatus {
+  TASK_UNKNOWN = 0;
+  TASK_PENDING = 1;      // 等待调度
+  TASK_ASSIGNED = 2;     // 已分配给 Worker
+  TASK_RUNNING = 3;      // 正在执行
+  TASK_COMPLETED = 4;    // 成功完成
+  TASK_FAILED = 5;       // 执行失败
+  TASK_CANCELLED = 6;    // 已取消
+  TASK_TIMEOUT = 7;      // 超时
+}
+
+// Worker 状态
+enum WorkerStatus {
+  WORKER_UNKNOWN = 0;
+  WORKER_ONLINE = 1;
+  WORKER_OFFLINE = 2;
+  WORKER_BUSY = 3;
+  WORKER_DRAINING = 4;
+  WORKER_MAINTENANCE = 5;
+}
+
+// Worker 资源信息
+message WorkerResources {
+  uint32 total_cpu_cores = 1;
+  uint64 total_memory_mb = 2;
+  uint64 total_disk_mb = 3;
+  uint32 used_cpu_cores = 4;
+  uint64 used_memory_mb = 5;
+  uint64 used_disk_mb = 6;
+  uint32 max_concurrent_tasks = 7;
+  uint32 active_tasks = 8;
+}
+
+// Worker 信息
+message WorkerInfo {
+  string worker_id = 1;
+  string address = 2;              // host:port
+  WorkerStatus status = 3;
+  WorkerResources resources = 4;
+  int64 last_heartbeat_ms = 5;     // Unix timestamp
+  int64 register_time_ms = 6;
+  uint64 total_completed = 7;
+  uint64 total_failed = 8;
+  map<string, string> labels = 9;  // 标签，用于亲和性调度
+}
+
+// 任务信息
+message TaskInfo {
+  string task_id = 1;
+  string source_node_id = 2;       // 来源 Tendisplus 节点
+  string db_name = 3;
+  uint32 store_id = 4;
+  TaskPriority priority = 5;
+  TaskStatus status = 6;
+  string assigned_worker_id = 7;
+  int64 submit_time_ms = 8;
+  int64 start_time_ms = 9;
+  int64 complete_time_ms = 10;
+  string error_message = 11;
+  uint32 retry_count = 12;
+}
+
+// ============================================================================
+// Tendisplus Node Requests/Responses
+// ============================================================================
+
+// 提交任务请求
+message SubmitTaskRequest {
+  string source_node_id = 1;       // Tendisplus 节点 ID
+  string db_name = 2;              // 数据库路径
+  uint32 store_id = 3;             // Store ID
+  uint64 job_id = 4;               // RocksDB job ID
+  string compaction_input = 5;     // 序列化的 compaction 输入
+  TaskPriority priority = 6;
+  
+  // 共享存储配置
+  string shared_fs_uri = 7;        // 共享文件系统 URI
+  string shared_fs_local_prefix = 8;
+  
+  // 超时配置
+  uint32 timeout_sec = 9;          // 任务超时时间
+
+  // CaaS-LSM 调度参数
+  int32 start_level = 10;          // compaction 起始层级
+  double score = 11;               // compaction 紧迫度分数
+  string compaction_args = 12;     // 原始 compaction 参数
+  string compaction_addition_info = 13;  // 附加信息
+}
+
+message SubmitTaskResponse {
+  bool success = 1;
+  string task_id = 2;              // 分配的任务 ID
+  string error_message = 3;
+}
+
+// 查询任务状态请求
+message QueryTaskRequest {
+  string task_id = 1;
+}
+
+message QueryTaskResponse {
+  bool found = 1;
+  TaskInfo task_info = 2;
+}
+
+// 取消任务请求
+message CancelTaskRequest {
+  string task_id = 1;
+  string reason = 2;
+}
+
+message CancelTaskResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// 等待任务结果请求
+message WaitResultRequest {
+  string task_id = 1;
+  uint32 timeout_ms = 2;           // 等待超时，0 表示立即返回
+}
+
+message WaitResultResponse {
+  bool completed = 1;
+  TaskStatus status = 2;
+  string compaction_result = 3;    // 序列化的 compaction 结果
+  string error_message = 4;
+  bool should_fallback = 5;        // CaaS-LSM: 是否应该降级到本地执行
+}
+
+// ============================================================================
+// CSA Worker Requests/Responses
+// ============================================================================
+
+// Worker 注册请求
+message RegisterWorkerRequest {
+  string worker_id = 1;            // Worker 自定义 ID (可选，控制平面可自动分配)
+  string address = 2;              // Worker 地址 host:port
+  WorkerResources resources = 3;   // 资源信息
+  map<string, string> labels = 4;  // 标签
+}
+
+message RegisterWorkerResponse {
+  bool success = 1;
+  string worker_id = 2;            // 分配或确认的 Worker ID
+  string error_message = 3;
+  uint32 heartbeat_interval_sec = 4;  // 心跳间隔
+}
+
+// 心跳请求
+message HeartbeatRequest {
+  string worker_id = 1;
+  WorkerResources resources = 2;   // 更新的资源信息
+  repeated string active_task_ids = 3;  // 当前活跃任务列表
+}
+
+message HeartbeatResponse {
+  bool success = 1;
+  repeated string tasks_to_cancel = 2;  // 需要取消的任务列表
+}
+
+// 注销请求
+message UnregisterWorkerRequest {
+  string worker_id = 1;
+  string reason = 2;
+}
+
+message UnregisterWorkerResponse {
+  bool success = 1;
+}
+
+// 上报任务结果
+message TaskResultRequest {
+  string worker_id = 1;
+  string task_id = 2;
+  bool success = 3;
+  string compaction_result = 4;    // 成功时的 compaction 结果
+  string error_message = 5;        // 失败时的错误信息
+  uint64 execution_time_ms = 6;    // 执行耗时
+  uint64 bytes_read = 7;           // 读取字节数
+  uint64 bytes_written = 8;        // 写入字节数
+}
+
+message TaskResultResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// 获取待执行任务 (Worker 拉取模式)
+message FetchTaskRequest {
+  string worker_id = 1;
+  uint32 max_tasks = 2;            // 最多获取任务数
+}
+
+message FetchTaskResponse {
+  repeated CompactionTask tasks = 1;
+}
+
+// Compaction 任务详情 (发送给 Worker)
+message CompactionTask {
+  string task_id = 1;
+  string db_name = 2;
+  uint32 store_id = 3;
+  uint64 job_id = 4;
+  string compaction_input = 5;
+  string shared_fs_uri = 6;
+  string shared_fs_local_prefix = 7;
+  uint32 timeout_sec = 8;
+}
+
+// ============================================================================
+// Admin Requests/Responses
+// ============================================================================
+
+// 集群状态请求
+message ClusterStatusRequest {}
+
+message ClusterStatusResponse {
+  uint32 total_workers = 1;
+  uint32 online_workers = 2;
+  uint32 pending_tasks = 3;
+  uint32 running_tasks = 4;
+  uint64 total_completed = 5;
+  uint64 total_failed = 6;
+}
+
+// Worker 列表请求
+message ListWorkersRequest {
+  WorkerStatus status_filter = 1;  // 0 表示全部
+}
+
+message ListWorkersResponse {
+  repeated WorkerInfo workers = 1;
+}
+
+// 任务统计请求
+message TaskStatisticsRequest {
+  int64 since_time_ms = 1;         // 统计起始时间，0 表示全部
+}
+
+message TaskStatisticsResponse {
+  uint64 total_submitted = 1;
+  uint64 total_completed = 2;
+  uint64 total_failed = 3;
+  uint64 total_cancelled = 4;
+  uint64 total_timeout = 5;
+  uint64 avg_execution_time_ms = 6;
+  uint64 avg_queue_time_ms = 7;
+  map<string, uint64> tasks_per_worker = 8;
+}
+
+// ============================================================================
+// CaaS-LSM: CSA Service Messages
+// ============================================================================
+
+// 分发任务请求 (推送模式)
+message DistributeJobRequest {
+  string task_id = 1;
+  string db_name = 2;
+  uint32 store_id = 3;
+  uint64 job_id = 4;
+  string compaction_args = 5;      // compaction 参数
+  string compaction_addition_info = 6;  // 附加信息
+  string shared_fs_uri = 7;
+  string shared_fs_local_prefix = 8;
+  uint32 timeout_sec = 9;
+  int32 start_level = 10;
+  double score = 11;
+}
+
+message DistributeJobResponse {
+  bool accepted = 1;               // 是否接受任务
+  string error_message = 2;
+}
+
+// CSA 状态请求
+message CSAStatusRequest {}
+
+message CSAStatusResponse {
+  uint32 local_task_nums = 1;      // 当前正在执行的任务数
+  double memory_free_ratio = 2;    // 内存空闲率
+  uint64 total_memory_mb = 3;
+  uint64 used_memory_mb = 4;
+  uint64 total_disk_mb = 5;
+  uint64 used_disk_mb = 6;
+  bool is_healthy = 7;             // 是否健康
+}
+
+// 取消任务请求
+message CancelRunningTaskRequest {
+  string task_id = 1;
+  string reason = 2;
+}
+
+message CancelRunningTaskResponse {
+  bool success = 1;
+  string error_message = 2;
+}
