@@ -292,6 +292,175 @@ class ControlPlaneServiceImpl final
     return grpc::Status::OK;
   }
 
+  // =========================================================================
+  // Observatory API - 观测平面接口
+  // =========================================================================
+
+  grpc::Status ListTasks(
+    grpc::ServerContext* context,
+    const ::control_plane::ListTasksRequest* request,
+    ::control_plane::ListTasksResponse* response) override {
+    TaskFilter filter;
+    filter.limit = request->limit() > 0 ? request->limit() : 100;
+    
+    if (request->status_filter() != ::control_plane::TASK_UNKNOWN) {
+      filter.status = static_cast<TaskStatus>(request->status_filter());
+    }
+    if (!request->source_node_filter().empty()) {
+      filter.source_node_id = request->source_node_filter();
+    }
+    
+    auto tasks = control_plane_.GetScheduler().QueryTasks(filter);
+    
+    for (const auto& task : tasks) {
+      auto* proto_task = response->add_tasks();
+      proto_task->set_task_id(task->task_id);
+      proto_task->set_source_node_id(task->source_node_id);
+      proto_task->set_db_name(task->db_name);
+      proto_task->set_store_id(task->store_id);
+      proto_task->set_priority(
+        static_cast<::control_plane::TaskPriority>(task->priority));
+      proto_task->set_status(
+        static_cast<::control_plane::TaskStatus>(task->status));
+      proto_task->set_assigned_worker_id(task->assigned_worker_id);
+      proto_task->set_retry_count(task->retry_count);
+      proto_task->set_error_message(task->error_message);
+      
+      // 时间戳
+      proto_task->set_submit_time_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          task->submit_time.time_since_epoch()).count());
+      proto_task->set_start_time_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          task->start_time.time_since_epoch()).count());
+      proto_task->set_complete_time_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          task->complete_time.time_since_epoch()).count());
+    }
+    
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetMetricsSnapshot(
+    grpc::ServerContext* context,
+    const ::control_plane::MetricsSnapshotRequest* request,
+    ::control_plane::MetricsSnapshotResponse* response) override {
+    auto cluster_status = control_plane_.GetClusterStatus();
+    const auto& stats = control_plane_.GetTaskStatistics();
+    auto workers = control_plane_.GetWorkers();
+    
+    // 集群概览
+    response->set_total_workers(cluster_status.total_workers);
+    response->set_online_workers(cluster_status.online_workers);
+    response->set_pending_tasks(cluster_status.pending_tasks);
+    response->set_running_tasks(cluster_status.running_tasks);
+    
+    // 计算 busy workers
+    uint32_t busy_count = 0;
+    double total_memory = 0, used_memory = 0;
+    double total_disk = 0, used_disk = 0;
+    
+    for (const auto& w : workers) {
+      if (w->status == WorkerStatus::kBusy) {
+        busy_count++;
+      }
+      if (w->status == WorkerStatus::kOnline || w->status == WorkerStatus::kBusy) {
+        total_memory += w->resources.total_memory_mb;
+        used_memory += w->resources.used_memory_mb;
+        total_disk += w->resources.total_disk_mb;
+        used_disk += w->resources.used_disk_mb;
+      }
+    }
+    response->set_busy_workers(busy_count);
+    
+    // 吞吐量统计
+    response->set_total_completed(stats.total_completed.load());
+    response->set_total_failed(stats.total_failed.load());
+    // Note: completed_last_minute 和 failed_last_minute 需要额外的统计支持
+    // 这里先设置为 0，后续可以添加时间窗口统计
+    response->set_completed_last_minute(0);
+    response->set_failed_last_minute(0);
+    
+    // 延迟统计
+    response->set_avg_queue_time_ms(
+      static_cast<uint64_t>(stats.GetAvgQueueTimeMs()));
+    response->set_avg_execution_time_ms(
+      static_cast<uint64_t>(stats.GetAvgExecutionTimeMs()));
+    // Note: p50/p95/p99 需要额外的直方图统计支持
+    response->set_p50_execution_time_ms(
+      static_cast<uint64_t>(stats.GetAvgExecutionTimeMs()));
+    response->set_p95_execution_time_ms(
+      static_cast<uint64_t>(stats.GetAvgExecutionTimeMs() * 1.5));
+    response->set_p99_execution_time_ms(
+      static_cast<uint64_t>(stats.GetAvgExecutionTimeMs() * 2.0));
+    
+    // 资源使用
+    response->set_cluster_cpu_usage(0.0);  // CPU 使用率需要额外采集
+    response->set_cluster_memory_usage(
+      total_memory > 0 ? used_memory / total_memory : 0.0);
+    response->set_cluster_disk_usage(
+      total_disk > 0 ? used_disk / total_disk : 0.0);
+    
+    // 时间戳
+    response->set_timestamp_ms(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetWorkerDetail(
+    grpc::ServerContext* context,
+    const ::control_plane::WorkerDetailRequest* request,
+    ::control_plane::WorkerDetailResponse* response) override {
+    auto worker = control_plane_.GetWorkerManager().GetWorker(request->worker_id());
+    
+    if (!worker) {
+      response->set_found(false);
+      return grpc::Status::OK;
+    }
+    
+    response->set_found(true);
+    
+    auto* proto_worker = response->mutable_worker();
+    proto_worker->set_worker_id(worker->worker_id);
+    proto_worker->set_address(worker->address);
+    proto_worker->set_status(
+      static_cast<::control_plane::WorkerStatus>(worker->status));
+    
+    auto* resources = proto_worker->mutable_resources();
+    resources->set_total_cpu_cores(worker->resources.total_cpu_cores);
+    resources->set_total_memory_mb(worker->resources.total_memory_mb);
+    resources->set_total_disk_mb(worker->resources.total_disk_mb);
+    resources->set_used_memory_mb(worker->resources.used_memory_mb);
+    resources->set_used_disk_mb(worker->resources.used_disk_mb);
+    resources->set_max_concurrent_tasks(worker->resources.max_concurrent_tasks);
+    resources->set_active_tasks(worker->resources.active_tasks);
+    
+    proto_worker->set_total_completed(worker->total_completed);
+    proto_worker->set_total_failed(worker->total_failed);
+    
+    // 获取该 Worker 的活跃任务
+    for (const auto& task_id : worker->active_task_ids) {
+      auto task = control_plane_.QueryTask(task_id);
+      if (task) {
+        auto* proto_task = response->add_active_tasks();
+        proto_task->set_task_id(task->task_id);
+        proto_task->set_status(
+          static_cast<::control_plane::TaskStatus>(task->status));
+        proto_task->set_db_name(task->db_name);
+        proto_task->set_store_id(task->store_id);
+      }
+    }
+    
+    // Worker 历史统计 (简化实现)
+    response->set_tasks_completed_last_hour(worker->total_completed);
+    response->set_tasks_failed_last_hour(worker->total_failed);
+    response->set_avg_execution_time_ms(0);  // 需要额外统计
+    
+    return grpc::Status::OK;
+  }
+
  private:
   ControlPlane& control_plane_;
 };

@@ -27,6 +27,8 @@
 // │   Tendisplus    │           │   CSA Worker 1  │         │   CSA Worker N  │
 // │   (DB Node)     │           │                 │   ...   │                 │
 // └─────────────────┘           └─────────────────┘         └─────────────────┘
+//
+// Observatory (监控界面) 现在是独立进程，使用 observatory_server 单独部署
 
 #include <signal.h>
 #include <unistd.h>
@@ -54,6 +56,8 @@ void PrintUsage(const char* program) {
             << "  -r <count>    Max task retries (default: 3)\n"
             << "  -H <seconds>  Worker heartbeat timeout (default: 30)\n"
             << "  -h            Show this help\n"
+            << "\nNote: Observatory (monitoring dashboard) is now a separate process.\n"
+            << "      Use observatory_server to start the monitoring dashboard.\n"
             << std::endl;
 }
 
@@ -119,7 +123,7 @@ int main(int argc, char* argv[]) {
   std::cout << "    Compaction-as-a-Service for Tendisplus" << std::endl;
   std::cout << "================================================" << std::endl;
   std::cout << "Configuration:" << std::endl;
-  std::cout << "  Listen address: " << config.listen_address << std::endl;
+  std::cout << "  gRPC address: " << config.listen_address << std::endl;
   std::cout << "  gRPC threads: " << config.grpc_max_threads << std::endl;
   std::cout << "  Scheduling policy: "
             << SchedulingPolicyToString(config.scheduler_config.policy)
@@ -132,6 +136,8 @@ int main(int argc, char* argv[]) {
   std::cout << "  Heartbeat timeout: "
             << config.worker_manager_config.heartbeat_timeout_sec << "s"
             << std::endl;
+  std::cout << "================================================" << std::endl;
+  std::cout << "Note: Use observatory_server for monitoring dashboard" << std::endl;
   std::cout << "================================================" << std::endl;
 
   // Setup signal handlers

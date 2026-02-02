@@ -35,7 +35,7 @@ target_link_libraries(control_plane_grpc_proto
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF})
 
-# Control plane core library
+# Control plane core library (不包含 observatory)
 add_library(control_plane_core STATIC
     task_model.cc
     worker_manager.cc
@@ -56,6 +56,33 @@ target_link_libraries(control_plane_server
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF})
+
+# ============================================================================
+# Observatory - 独立可视化观测平面
+# ============================================================================
+
+# Observatory library (独立的 gRPC 客户端)
+add_library(observatory STATIC
+    observatory.cc)
+target_link_libraries(observatory
+    control_plane_grpc_proto
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF})
+
+# Observatory server executable (独立部署)
+add_executable(observatory_server
+    observatory_server.cc)
+target_link_libraries(observatory_server
+    observatory
+    control_plane_grpc_proto
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF})
+
+# ============================================================================
+# Client Libraries (for integration)
+# ============================================================================
 
 # Control plane client library (for Tendisplus integration)
 add_library(control_plane_client STATIC
