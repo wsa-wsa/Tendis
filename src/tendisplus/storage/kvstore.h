@@ -354,7 +354,7 @@ struct TruncateBinlogResult {
   uint64_t written;
   int32_t err;
 };
-
+class ServerParams;
 class KVStore {
  public:
   enum class StoreMode { READ_WRITE = 0, REPLICATE_ONLY = 1, STORE_NONE = 2 };
@@ -498,14 +498,19 @@ class KVStore {
   virtual void appendJSONStat(
     rapidjson::PrettyWriter<rapidjson::StringBuffer>&) const = 0;
 
+  virtual const std::shared_ptr<ServerParams>& getCfg() const = 0;
   uint64_t getBinlogTime() const;
   void setBinlogTime(uint64_t timestamp);
   uint64_t getCurrentTime() const;
   virtual Status setOptionDynamic(const std::string& option,
                                   const std::string& value) = 0;
   virtual Status setCompactOnDeletionCollectorFactory(
-    const std::string& option, const std::string& value) = 0;
-  virtual int64_t getOption(const std::string& option) = 0;
+    const std::string& option,
+    std::shared_ptr<tendisplus::ServerParams> cfg) = 0;
+  virtual int64_t getDBOption(const std::string& option) = 0;
+  virtual int64_t getCFOption(ColumnFamilyNumber cf,
+                              const std::string& option) = 0;
+
 
   KVStoreStat stat;
 

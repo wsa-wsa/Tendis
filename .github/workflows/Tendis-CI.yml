@@ -2,9 +2,10 @@ name: Tendis-build-CI
 # Controls when the action will run.
 on:
   pull_request:
-    branches: [unstable, master]
+    branches: [unstable, master, 2.8.tx]
   push:
-    branches: [unstable, master]
+  # set to a branch that does not exist to disable the workflow
+    branches: [notExistBranch]
 jobs:
   cpplint-check:
     name: Lint
@@ -24,24 +25,27 @@ jobs:
         run: |
           export PATH=$PATH:~/.local/bin/
           files=`git diff --name-only HEAD HEAD~1`
+          exit_codes=0
           echo "$files" | while read file
           do
             if [[ $file =~ \.cc$ || $file =~ \.h$ || $file =~ \.hpp$ || $file =~ \.cpp$ ]]; then
               if [[ -f $file ]]; then
-                if [[ $file =~ ^src/tendisplus/tools/ldb_ || $file =~ src/tendisplus/include/optional.h ]]; then
+                if [[ $file =~ ^src/tendisplus/tools/ldb_ || $file =~ src/tendisplus/include/optional.h || $file =~ src/thirdparty ]]; then
                   echo "cpplint skip $file"
                   continue
                 else
                   echo "cpplint --filter=\"-runtime/reference\" $file"
                   cpplint --filter="-runtime/reference,-whitespace/indent_namespace" $file
-                  if [[ $? -ne 0 ]]; then
-                      echo "Run cpplint against $file failed..."
-                      exit 1
-                  fi
+                  exit_code=$?
+                  exit_codes=$((exit_codes + exit_code))
                 fi
               fi
             fi
           done
+          if [[ $exit_codes -ne 0 ]]; then
+            echo "Run cpplint against $file failed..."
+            exit 1
+          fi
       - name: format
         run: |
           export PATH=$PATH:~/.local/bin/
@@ -66,7 +70,6 @@ jobs:
                 fi
               fi
             fi
-          
             if [[ $file =~ \.go$ ]]; then
               if [[ -f $file ]]; then
                 if [[ $file =~ ^src/tendisplus/misc || $file =~ src/tendisplus/perftools ||
@@ -85,7 +88,6 @@ jobs:
               fi
             fi
           done
-          
   test-unittest-sh:
     needs: [cpplint-check]
     name: Test-unittest.sh
@@ -111,7 +113,6 @@ jobs:
               exit $errcnt1
           fi
           exit 0
-
   test-redistest-sh:
     needs: [cpplint-check]
     name: Test-redistest.sh
@@ -214,7 +215,6 @@ jobs:
           cd src/tendisplus/integrate_test
           chmod +x gotest.sh
           ./gotest.sh normaltest-part1
-
   test-gotest-normaltest-part2:
     needs: [cpplint-check]
     name: Test-gotest-normaltest-part2
@@ -232,7 +232,6 @@ jobs:
           cd src/tendisplus/integrate_test
           chmod +x gotest.sh
           ./gotest.sh normaltest-part2
-
   test-gotest-normaltest-part3:
     needs: [cpplint-check]
     name: Test-gotest-normaltest-part3
@@ -250,4 +249,50 @@ jobs:
           cd src/tendisplus/integrate_test
           chmod +x gotest.sh
           ./gotest.sh normaltest-part3
-
+  test-gotest-versiontest:
+    needs: [cpplint-check]
+    name: Test-gotest-versiontest
+    runs-on: ubuntu-latest
+    env:
+        GH_TOKEN: ${{ github.token }}
+        TEST_DIR: build/bin
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: compile
+        uses: ./.github/actions/compile/
+      - name: GoTest
+        run: |
+          cd src/tendisplus/integrate_test
+          mkdir -p "releases"
+          threshold="2.4.0"
+          version_le() {
+            [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$1" ]]
+          }
+          tags=$(gh api /repos/${{ github.repository }}/releases --jq '.[].tag_name')
+          VERSIONS=""
+          for tag in $tags; do
+            ver=${tag%%-*}
+            if ! [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                continue
+            fi
+            if version_le "$ver" "$threshold"; then
+                continue
+            else
+            patch=${ver##*.}
+            [[ "$patch" == "0" ]] && VERSIONS+="$tag "
+            fi
+          done
+          VERSIONS+="2.4.3-rocksdb-v5.13.4 2.3.1-rocksdb-v5.13.4"
+          for ver in $VERSIONS; do
+            gh release download $ver -D releases
+            echo "downloaded $ver"
+          done
+          chmod +x gotest.sh
+          echo "versiontest start"
+          echo "./gotest.sh versiontest $VERSIONS"
+          ./gotest.sh versiontest $VERSIONS
+          echo "versiontest done"

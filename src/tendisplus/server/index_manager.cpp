@@ -12,7 +12,6 @@
 
 #include "tendisplus/commands/command.h"
 #include "tendisplus/utils/invariant.h"
-#include "tendisplus/utils/portable.h"
 #include "tendisplus/utils/scopeguard.h"
 #include "tendisplus/utils/string.h"
 #include "tendisplus/utils/sync_point.h"
@@ -39,11 +38,13 @@ IndexManager::IndexManager(std::shared_ptr<ServerEntry> svr,
     _delJobCnt[storeId] = {0u};
   }
 
-  _cfg->serverParamsVar("scanJobCntIndexMgr")->setUpdate([this]() {
+  _cfg->serverParamsVar("scanJobCntIndexMgr")->setUpdate([this]() -> Status {
     indexScannerResize(_cfg->scanJobCntIndexMgr);
+    return {ErrorCodes::ERR_OK, ""};
   });
-  _cfg->serverParamsVar("delJobCntIndexMgr")->setUpdate([this]() {
+  _cfg->serverParamsVar("delJobCntIndexMgr")->setUpdate([this]() -> Status {
     keyDeleterResize(_cfg->delJobCntIndexMgr);
+    return {ErrorCodes::ERR_OK, ""};
   });
 }
 
@@ -110,7 +111,7 @@ std::string IndexManager::getInfoString() {
   uint64_t minttl = -1;
 
   auto ttlStr = [](uint64_t ttl) {
-    if (ttl == (uint64_t)-1) {
+    if (ttl == static_cast<uint64_t>(-1)) {
       return std::to_string(-1);
     } else {
       return msEpochToDatetime(ttl);
@@ -123,8 +124,7 @@ std::string IndexManager::getInfoString() {
       minttl = _scanPonitsTtl[i];
     }
   }
-  ss << "scanpoint"
-     << ":" << ttlStr(minttl) << "\r\n";
+  ss << "scanpoint" << ":" << ttlStr(minttl) << "\r\n";
 
   return ss.str();
 }

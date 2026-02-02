@@ -26,9 +26,12 @@
 
 #ifndef WIN32
 #ifdef TENDIS_JEMALLOC
+#include <malloc.h>
+
 #include "jemalloc/jemalloc.h"
 #endif  // !TENDIS_JEMALLOC
 #endif  // !WIN32
+#include "port/jemalloc_helper.h"
 #include "rapidjson/document.h"
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/stringbuffer.h"
@@ -47,6 +50,162 @@
 #include "tendisplus/utils/sync_point.h"
 
 namespace tendisplus {
+
+class IterAllGeneric : public Command {
+ public:
+  IterAllGeneric(const std::string& name, const char* sflags)
+    : Command(name, sflags) {}
+
+  virtual Status callBack(Session* sess,
+                          PStore kvstore,
+                          const RecordKey& rk,
+                          const RecordValue& rv) = 0;
+  Status scanAllKeys(Session* sess) {
+    Status status;
+    auto server = sess->getServerEntry();
+    std::bitset<CLUSTER_SLOTS> checkSlots;
+    bool enableCluster = server->getParams()->clusterEnabled;
+    if (enableCluster) {
+      auto myself = server->getClusterMgr()->getClusterState()->getMyselfNode();
+      checkSlots = myself->nodeIsMaster() ? myself->getSlots()
+                                          : myself->getMaster()->getSlots();
+    }
+
+    for (ssize_t i = 0; i < server->getKVStoreCount(); i++) {
+      auto expdb =
+        server->getSegmentMgr()->getDb(sess, i, mgl::LockMode::LOCK_IS);
+      if (!expdb.ok()) {
+        if (expdb.status().code() == ErrorCodes::ERR_STORE_NOT_OPEN) {
+          continue;
+        }
+        return expdb.status();
+      }
+
+      PStore kvstore = expdb.value().store;
+      auto ptxn = sess->getCtx()->createTransaction(kvstore);
+      if (!ptxn.ok()) {
+        return ptxn.status();
+      }
+
+      auto cursor = ptxn.value()->createDataCursor();
+
+      cursor->seek("");
+      while (true) {
+        Expected<Record> exptRcd = cursor->next();
+        if (exptRcd.status().code() == ErrorCodes::ERR_EXHAUST) {
+          break;
+        }
+        if (!exptRcd.ok()) {
+          return exptRcd.status();
+        }
+
+        if (exptRcd.value().getRecordKey().getDbId() !=
+            sess->getCtx()->getDbId()) {
+          continue;
+        }
+        // NOTE(vinchen):
+        // RecordType::RT_TTL_INDEX and RecordType::BINLOG
+        // is always at the last of rocksdb, and the chunkid is very big
+        auto chunkId = exptRcd.value().getRecordKey().getChunkId();
+        if (chunkId >= server->getSegmentMgr()->getChunkSize()) {
+          break;
+        }
+        // NOTE(wayenchen) ignore slot not belong to me
+        if (enableCluster && !checkSlots.test(chunkId)) {
+          continue;
+        }
+
+        callBack(sess,
+                 kvstore,
+                 exptRcd.value().getRecordKey(),
+                 exptRcd.value().getRecordValue());
+      }
+    }
+    return status;
+  }
+};
+
+// Build Str TTL Index
+class BstiCommand : public IterAllGeneric {
+ public:
+  BstiCommand() : IterAllGeneric("bsti", "ws") {}
+
+  ssize_t arity() const {
+    return 1;
+  }
+
+  int32_t firstkey() const {
+    return 0;
+  }
+
+  int32_t lastkey() const {
+    return 0;
+  }
+
+  int32_t keystep() const {
+    return 0;
+  }
+
+  bool sameWithRedis() const {
+    return false;
+  }
+
+  Status callBack(Session* sess,
+                  PStore kvstore,
+                  const RecordKey& rk,
+                  const RecordValue& rv) override {
+    Status status;
+    if (rv.getRecordType() != RecordType::RT_KV) {
+      return status;
+    }
+    if (!needTTLIndex(kvstore, rv)) {
+      return status;
+    }
+
+    std::vector<std::string> keys;
+    keys.push_back(rk.getPrimaryKey());
+    std::vector<int> index;
+    index.push_back(0);
+    auto locklist = sess->getServerEntry()->getSegmentMgr()->getAllKeysLocked(
+      sess, keys, index, mgl::LockMode::LOCK_X, getFlags());
+    if (!locklist.ok()) {
+      return locklist.status();
+    }
+
+    auto eTxn = kvstore->createTransaction(nullptr);
+    if (!eTxn.ok()) {
+      LOG(ERROR) << "createTransaction failed:" << eTxn.status().toString();
+      return eTxn.status();
+    }
+    std::unique_ptr<Transaction> txn = std::move(eTxn.value());
+
+    _updateNum++;
+    status = updateTTLIndex(kvstore, rk, rv, txn.get(), 0);
+    if (!status.ok()) {
+      return status;
+    }
+
+    auto commitStatus = txn->commit();
+    if (!commitStatus.ok()) {
+      return commitStatus.status();
+    }
+    return status;
+  }
+
+  Expected<std::string> run(Session* sess) final {
+    LOG(INFO) << "Build Str TTL Index begin.";
+    _updateNum = 0;
+    auto s = scanAllKeys(sess);
+    LOG(INFO) << "Build Str TTL Index end, updateNum:" << _updateNum;
+    if (!s.ok()) {
+      return s;
+    }
+    return Command::fmtLongLong(_updateNum);
+  }
+
+ private:
+  uint64_t _updateNum;
+} bstiCmd;
 
 class KeysCommand : public Command {
  public:
@@ -2086,6 +2245,7 @@ class InfoCommand : public Command {
     infoLevelStats(allsections, defsections, section, sess, result);
     infoRocksdbStats(allsections, defsections, section, sess, result);
     infoRocksdbPerfStats(allsections, defsections, section, sess, result);
+    infoLatencyMonitor(allsections, defsections, section, sess, result);
     infoRocksdbBgError(allsections, defsections, section, sess, result);
 
     return Command::fmtBulk(result.str());
@@ -2713,6 +2873,20 @@ class InfoCommand : public Command {
     }
   }
 
+  static void infoLatencyMonitor(bool allsections,
+                                 bool defsections,
+                                 const std::string& section,
+                                 Session* sess,
+                                 std::stringstream& result) {
+    if (allsections || defsections || section == "latencymonitor") {
+      auto server = sess->getServerEntry();
+
+      result << "# LatencyMonitor\r\n";
+      result << server->getLatencyMonitorSet().getLatencyInfo();
+      result << "\r\n";
+    }
+  }
+
   static void infoRocksdbBgError(bool allsections,
                                  bool defsections,
                                  const std::string& section,
@@ -2976,6 +3150,15 @@ class ConfigCommand : public Command {
       LOG(INFO) << ss.str();
       auto svr = sess->getServerEntry();
       svr->resetRocksdbStats(sess);
+    }
+    if (reset_all || configName == "latency") {
+      LOG(INFO) << "reset latency";
+      std::stringstream ss;
+      InfoCommand::infoLatencyMonitor(true, true, "latencymonitor", sess, ss);
+      LOG(INFO) << ss.str();
+
+      auto svr = sess->getServerEntry();
+      svr->resetLatencyStat();
     }
   }
 
@@ -5075,12 +5258,26 @@ class JeprofCommand : public Command {
 
   Expected<std::string> getUsage() {
 #ifdef TENDIS_JEMALLOC
-    std::vector<std::string> nameList = {"stats.allocated",
-                                         "stats.active",
-                                         "stats.metadata",
-                                         "stats.resident",
-                                         "stats.mapped",
-                                         "stats.retained"};
+    enum type{
+      UNKOWN = 0,
+      BYTE,
+      TIME,
+    };
+    struct statsInfo {
+      std::string name;
+      int type;
+    };
+    std::vector<statsInfo> nameList = {
+      {"stats.allocated", type::BYTE},
+      {"stats.active", type::BYTE},
+      {"stats.metadata", type::BYTE},
+      {"stats.resident", type::BYTE},
+      {"stats.mapped", type::BYTE},
+      {"stats.retained", type::BYTE},
+      {"stats.background_thread.num_threads", type::UNKOWN},
+      {"stats.background_thread.run_interval", type::TIME},
+      { "stats.background_thread.num_runs",
+        type::UNKOWN }};
 
     // NOTE(takenliu): we need refresh jamalloc statistic data,
     //   but mallctl("epoch",xxx) maybe have bug and cant refresh,
@@ -5089,17 +5286,25 @@ class JeprofCommand : public Command {
 
     std::stringstream ss;
     Command::fmtMultiBulkLen(ss, nameList.size());
-    for (const auto& name : nameList) {
+    for (const auto& info : nameList) {
       size_t allocated;
       size_t len = sizeof(allocated);
 
-      if (mallctl(name.c_str(), &allocated, &len, NULL, 0) == 0) {
+      if (mallctl(info.name.c_str(), &allocated, &len, NULL, 0) == 0) {
       } else {
         return {ErrorCodes::ERR_UNKNOWN, "mallctl() failed."};
       }
-      Command::fmtBulk(ss,
-                       name + ": " + std::to_string(allocated) + " (" +
-                         getSizeReadable(allocated) + ")");
+      if (info.type == type::BYTE) {
+        Command::fmtBulk(ss,
+                         info.name + ": " + std::to_string(allocated) + " (" +
+                           getSizeReadable(allocated) + ")");
+      } else if (info.type == type::TIME) {
+        Command::fmtBulk(ss,
+                         info.name + ": " + std::to_string(allocated) + " (" +
+                           getTimeReadable(allocated) + ")");
+      } else {
+        Command::fmtBulk(ss, info.name + ": " + std::to_string(allocated));
+      }
     }
     return ss.str();
 #else
@@ -5118,6 +5323,28 @@ class JeprofCommand : public Command {
       mallctl("prof.active", NULL, NULL, &active, sizeof(active));
     } else if (action == "dump") {
       mallctl("prof.dump", NULL, NULL, NULL, 0);
+    } else if (action == "arena.purge") {
+      unsigned narenas = 0;
+      size_t sz = sizeof(narenas);
+      mallctl("arenas.narenas", &narenas, &sz, NULL, 0);
+      for (size_t arena_index = 0; arena_index < narenas; arena_index++) {
+        char mallctl_path[64];
+        snprintf(
+          mallctl_path, sizeof(mallctl_path), "arena.%ld.purge", arena_index);
+        int ret = mallctl(mallctl_path, NULL, NULL, NULL, 0);
+        if (ret != 0) {
+          const char* err_msg = strerror(errno);
+          return {ErrorCodes::ERR_UNKNOWN,
+                  std::string(err_msg, strlen(err_msg))};
+        }
+      }
+      LOG(INFO) << "Purged arenas success, narenas:" << narenas;
+    } else if (action == "trim") {
+      int ret = malloc_trim(0);
+      if (ret != 0) {
+        const char* err_msg = strerror(errno);
+        return {ErrorCodes::ERR_UNKNOWN, std::string(err_msg, strlen(err_msg))};
+      }
     } else if (action == "stats") {
       return getUsage();
     } else {
@@ -5133,4 +5360,36 @@ class JeprofCommand : public Command {
   }
 } jeprofCommand;
 
+class GlogCommand : public Command {
+ public:
+  GlogCommand() : Command("glog", "as") {}
+
+  ssize_t arity() const {
+    return 2;
+  }
+
+  int32_t firstkey() const {
+    return 0;
+  }
+
+  int32_t lastkey() const {
+    return 0;
+  }
+
+  int32_t keystep() const {
+    return 0;
+  }
+
+  Expected<std::string> run(Session* sess) final {
+    const std::vector<std::string>& args = sess->getArgs();
+    auto action = toLower(args[1]);
+    if (action == "flush") {
+      google::FlushLogFiles(google::GLOG_INFO);
+    } else {
+      return {ErrorCodes::ERR_UNKNOWN,
+              "args wrong, only support: glog [flush]"};
+    }
+    return Command::fmtOK();
+  }
+} glogCommand;
 }  // namespace tendisplus

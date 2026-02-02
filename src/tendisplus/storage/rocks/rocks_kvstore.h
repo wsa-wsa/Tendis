@@ -392,30 +392,34 @@ class RocksKVStore : public KVStore {
   // NOTE(deyukong): this api is only for debug
   std::set<uint64_t> getUncommittedTxns() const;
 
-  const std::shared_ptr<ServerParams>& getCfg() const {
+  const std::shared_ptr<ServerParams>& getCfg() const override {
     return _cfg;
   }
 
   bool getIntProperty(
     const std::string& property,
     uint64_t* value,
-    ColumnFamilyNumber cf = ColumnFamilyNumber::ColumnFamily_Default) const;
-  bool getProperty(
-    const std::string& property,
-    std::string* value,
-    ColumnFamilyNumber cf = ColumnFamilyNumber::ColumnFamily_Default) const;
+    ColumnFamilyNumber cf =
+      ColumnFamilyNumber::ColumnFamily_Default) const override;
+  bool getProperty(const std::string& property,
+                   std::string* value,
+                   ColumnFamilyNumber cf =
+                     ColumnFamilyNumber::ColumnFamily_Default) const override;
   std::string getAllProperty() const override;
   std::string getStatistics() const override;
   uint64_t getStatCountById(uint32_t id) const override;
   uint64_t getStatCountByName(const std::string& name) const override;
   std::string getBgError() const override;
   Status recoveryFromBgError() override;
-  void resetStatistics();
+  void resetStatistics() override;
   Status setOptionDynamic(const std::string& option,
                           const std::string& value) override;
   Status setCompactOnDeletionCollectorFactory(
-    const std::string& option, const std::string& value) override;
-  int64_t getOption(const std::string& option) override;
+    const std::string& option,
+    std::shared_ptr<tendisplus::ServerParams> cfg) override;
+  int64_t getDBOption(const std::string& option) override;
+  int64_t getCFOption(ColumnFamilyNumber cf,
+                      const std::string& option) override;
   const rocksdb::Snapshot* getSnapshot();
   rocksdb::Iterator* newIterator(const rocksdb::ReadOptions& readOptions,
                                  rocksdb::ColumnFamilyHandle* columnFamily);
@@ -556,7 +560,6 @@ class RocksdbEnv {
   }
   std::string getErrorString() const;
   void clear();
-  void resetError();
   void setError(rocksdb::BackgroundErrorReason reason, rocksdb::Status* error);
 
  private:

@@ -4,6 +4,10 @@
 
 #include "tendisplus/cluster/migrate_receiver.h"
 
+#include <memory>
+#include <string>
+#include <utility>
+
 #include "tendisplus/commands/command.h"
 
 namespace tendisplus {
@@ -121,6 +125,8 @@ Status ChunkMigrateReceiver::receiveSnapshot() {
     } else if (exptData.value()[0] == '1') {
       SyncWriteData("+OK")
     } else if (exptData.value()[0] == '2') {
+      LOG(INFO) << "migrate snapshot one slot done, readnum:"
+                << getSnapshotNum() << " taskid:" << _taskid;
       SyncWriteData("+OK")
     } else if (exptData.value()[0] == '3') {
       SyncWriteData("+OK") break;
@@ -130,7 +136,7 @@ Status ChunkMigrateReceiver::receiveSnapshot() {
     }
   }
   LOG(INFO) << "migrate snapshot transfer done, readnum:" << getSnapshotNum()
-            << "taskid:" << _taskid;
+            << " taskid:" << _taskid;
 
   setSnapShotEndTime(msSinceEpoch());
   return {ErrorCodes::ERR_OK, ""};
@@ -173,18 +179,9 @@ Status ChunkMigrateReceiver::supplySetKV(const std::string& key,
   // only RT_*_META need recover, it's saved as RT_DATA_META in RecordKey
   // if RecordValue's type is RT_KV need ignore recovering.
   if (expRk.value().getRecordType() == RecordType::RT_DATA_META) {
-    if (expRv.value().getTtl() > 0 &&
-        expRv.value().getRecordType() != RecordType::RT_KV) {
-      // add new index entry
-      TTLIndex n_ictx(expRk.value().getPrimaryKey(),
-                      expRv.value().getRecordType(),
-                      expRk.value().getDbId(),
-                      expRv.value().getTtl());
-      s = txn->setKV(n_ictx.encode(),
-                     RecordValue(RecordType::RT_TTL_INDEX).encode());
-      if (!s.ok()) {
-        return s;
-      }
+    s = updateTTLIndex(kvstore, expRk.value(), expRv.value(), txn.get(), 0);
+    if (!s.ok()) {
+      return s;
     }
   }
 
@@ -252,22 +249,14 @@ Status ChunkMigrateReceiver::PutSingleBatch(const std::string& migrateBatch,
     // only RT_*_META need recover, it's saved as RT_DATA_META in RecordKey
     // if RecordValue's type is RT_KV need ignore recovering.
     if (expRk.value().getRecordType() == RecordType::RT_DATA_META) {
-      if (expRv.value().getTtl() > 0 &&
-          expRv.value().getRecordType() != RecordType::RT_KV) {
-        // add new index entry
-        TTLIndex n_ictx(expRk.value().getPrimaryKey(),
-                        expRv.value().getRecordType(),
-                        expRk.value().getDbId(),
-                        expRv.value().getTtl());
-        s = txn->setKV(n_ictx.encode(),
-                       RecordValue(RecordType::RT_TTL_INDEX).encode());
-        RET_IF_ERR(s);
+      s = updateTTLIndex(kvstore, expRk.value(), expRv.value(), txn.get(), 0);
+      if (!s.ok()) {
+        return s;
       }
     }
     batchItem++;
   }
-  DLOG(INFO) << "supplyKVBatch "
-             << "size:" << migrateBatch.size() << "content end";
+  DLOG(INFO) << "supplyKVBatch size:" << migrateBatch.size() << " content end";
   auto commitStatus = txn->commit();
   if (!commitStatus.ok()) {
     return commitStatus.status();

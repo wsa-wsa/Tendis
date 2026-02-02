@@ -3,6 +3,7 @@
 // project for additional information.
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -11,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <regex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,7 +25,6 @@
 #include "tendisplus/server/server_params.h"
 #include "tendisplus/storage/rocks/rocks_kvstore.h"
 #include "tendisplus/utils/invariant.h"
-#include "tendisplus/utils/portable.h"
 #include "tendisplus/utils/redis_port.h"
 #include "tendisplus/utils/scopeguard.h"
 #include "tendisplus/utils/status.h"
@@ -873,6 +874,70 @@ void testSlowLog(std::shared_ptr<ServerEntry> svr) {
   EXPECT_TRUE(expect.ok());
 }
 
+void testLatencyMonitor(std::shared_ptr<ServerEntry> svr) {
+  asio::io_context ioContext;
+  asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
+  NetSession sess(svr, std::move(socket), 1, false, nullptr, nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    std::string key = "key" + std::to_string(i);
+    std::string value = "value" + std::to_string(i);
+    sess.setArgs({"set", key.c_str(), value.c_str()});
+    auto expect = Command::runSessionCmd(&sess);
+    EXPECT_TRUE(expect.ok());
+  }
+  for (int i = 0; i < 100; i++) {
+    std::string key = "key" + std::to_string(i);
+    sess.setArgs({"get", key.c_str()});
+    auto expect = Command::runSessionCmd(&sess);
+    EXPECT_TRUE(expect.ok());
+  }
+  std::regex pattern(R"(LatencyMonitorName:[^\n]+\n((?:[<=|>|T].*\n)+))");
+  std::smatch matches;
+  bool found = false;
+  for (int i = 0; i < 100; i++) {
+    sess.setArgs({"info"});
+    auto expect = Command::runSessionCmd(&sess);
+    EXPECT_TRUE(expect.ok());
+    found = std::regex_search(expect.value(), matches, pattern);
+    if (found) {
+      assert(matches.size() > 2);
+      std::string res = matches[1];
+      assert(res.size() > 10);
+      auto v = res.substr(res.size() - 10, res.size());
+      EXPECT_EQ(std::stoi(v), 200 + i);
+    }
+    EXPECT_EQ(found, true);
+  }
+  sess.setArgs({"info", "latencymonitor"});
+  auto expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  found = std::regex_search(expect.value(), matches, pattern);
+  if (found) {
+    assert(matches.size() > 2);
+    std::string res = matches[1];
+    assert(res.size() > 10);
+    auto v = res.substr(res.size() - 10, res.size());
+    EXPECT_EQ(std::stoi(v), 300);
+  }
+  EXPECT_EQ(found, true);
+  sess.setArgs({"config", "resetStat", "latency"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  sess.setArgs({"info", "latencymonitor"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  found = std::regex_search(expect.value(), matches, pattern);
+  if (found) {
+    assert(matches.size() > 2);
+    std::string res = matches[1];
+    assert(res.size() > 10);
+    auto v = res.substr(res.size() - 10, res.size());
+    EXPECT_EQ(std::stoi(v), 1);
+  }
+  EXPECT_EQ(found, true);
+}
+
 void testGlobStylePattern(std::shared_ptr<ServerEntry> svr) {
   asio::io_context ioContext;
   asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
@@ -1235,6 +1300,25 @@ TEST(Command, slowlog) {
   ptr = fgets(line, sizeof(line) - 1, fp);
   EXPECT_STRCASEEQ(line, "[] set ss2 b \n");
   pclose(fp);
+}
+#endif  // !
+
+#ifndef _WIN32
+TEST(Command, latency) {
+  const auto guard = MakeGuard([] { destroyEnv(); });
+
+  {
+    EXPECT_TRUE(setupEnv());
+    auto cfg = makeServerParam();
+    auto server = makeServerEntry(cfg);
+
+    testLatencyMonitor(server);
+
+#ifndef _WIN32
+    server->stop();
+    EXPECT_EQ(server.use_count(), 1);
+#endif
+  }
 }
 #endif  // !
 
@@ -2284,15 +2368,37 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
   EXPECT_EQ("*2\r\n$27\r\nrocks.blob_compression_type\r\n$3\r\nlz4\r\n",
             expect.value());
 
-  std::stringstream ss;
-
-  sess.setArgs({"CONFIG", "GET", "rocks.max_background_jobs"});
+  sess.setArgs({"CONFIG", "SET", "rocks.blob_compression_type", "snappy"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
-  Command::fmtMultiBulkLen(ss, 2);
-  Command::fmtBulk(ss, "rocks.max_background_jobs");
-  Command::fmtBulk(ss, "2");
-  EXPECT_EQ(ss.str(), expect.value());
+
+  sess.setArgs({"CONFIG", "GET", "rocks.blob_compression_type"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ("*2\r\n$27\r\nrocks.blob_compression_type\r\n$6\r\nsnappy\r\n",
+            expect.value());
+
+  sess.setArgs({"CONFIG", "SET", "rocks.blob_compression_type", "snappy111"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_FALSE(expect.ok());
+
+  sess.setArgs({"CONFIG", "GET", "rocks.blob_compression_type"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ("*2\r\n$27\r\nrocks.blob_compression_type\r\n$6\r\nsnappy\r\n",
+            expect.value());
+
+  sess.setArgs({"CONFIG", "SET", "rocks.blob_compression_type", "lz4"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+
+  sess.setArgs({"CONFIG", "GET", "rocks.blob_compression_type"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ("*2\r\n$27\r\nrocks.blob_compression_type\r\n$3\r\nlz4\r\n",
+            expect.value());
+
+  std::stringstream ss;
 
   sess.setArgs({"CONFIG", "SET", "rocks.max_background_jobs", "3"});
   expect = Command::runSessionCmd(&sess);
@@ -2302,7 +2408,7 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
     EXPECT_TRUE(exptDb.ok());
 
     auto store = exptDb.value().store;
-    EXPECT_EQ(store->getOption("rocks.max_background_jobs"), 3);
+    EXPECT_EQ(store->getDBOption("rocks.max_background_jobs"), 3);
   }
 
   sess.setArgs({"CONFIG", "GET", "rocks.max_background_jobs"});
@@ -2314,15 +2420,6 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
   Command::fmtBulk(ss, "3");
   EXPECT_EQ(ss.str(), expect.value());
 
-  sess.setArgs({"CONFIG", "GET", "rocks.max_open_files"});
-  expect = Command::runSessionCmd(&sess);
-  EXPECT_TRUE(expect.ok());
-  ss.str("");
-  Command::fmtMultiBulkLen(ss, 2);
-  Command::fmtBulk(ss, "rocks.max_open_files");
-  Command::fmtBulk(ss, "-1");
-  EXPECT_EQ(ss.str(), expect.value());
-
   sess.setArgs({"CONFIG", "SET", "rocks.max_open_files", "3000"});
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
@@ -2331,7 +2428,7 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
     EXPECT_TRUE(exptDb.ok());
 
     auto store = exptDb.value().store;
-    EXPECT_EQ(store->getOption("rocks.max_open_files"), 3000);
+    EXPECT_EQ(store->getDBOption("rocks.max_open_files"), 3000);
   }
 
   sess.setArgs({"CONFIG", "GET", "rocks.max_open_files"});
@@ -2351,7 +2448,7 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
     EXPECT_TRUE(exptDb.ok());
 
     auto store = exptDb.value().store;
-    EXPECT_EQ(store->getOption("rocks.max_open_files"), -1);
+    EXPECT_EQ(store->getDBOption("rocks.max_open_files"), -1);
   }
 
   sess.setArgs({"CONFIG", "GET", "rocks.max_open_files"});
@@ -2371,7 +2468,9 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
     EXPECT_TRUE(exptDb.ok());
 
     auto store = exptDb.value().store;
-    EXPECT_EQ(store->getOption("rocks.periodic_compaction_seconds"), 3);
+    EXPECT_EQ(store->getCFOption(ColumnFamilyNumber::ColumnFamily_Default,
+                                 "rocks.periodic_compaction_seconds"),
+              3);
   }
 
   sess.setArgs({"CONFIG", "GET", "rocks.periodic_compaction_seconds"});
@@ -2387,44 +2486,16 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
   std::string err;
   sess.setArgs({"CONFIG", "SET", "rocks.compaction_deletes_window", "100"});
   expect = Command::runSessionCmd(&sess);
-#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
   EXPECT_TRUE(expect.ok());
-#else
-  EXPECT_FALSE(expect.ok());
-  err = Command::fmtErr(
-    "-ERR:3,msg:rocks.compaction_deletes_window can't be changed dynmaically "
-    "in rocksdb(version < 6.11)\r\n");
-  EXPECT_EQ(err, expect.status().toString());
-#endif
 
   sess.setArgs({"CONFIG", "SET", "rocks.compaction_deletes_trigger", "50"});
   expect = Command::runSessionCmd(&sess);
-#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
   EXPECT_TRUE(expect.ok());
-#else
-  EXPECT_FALSE(expect.ok());
-  err.clear();
-  err = Command::fmtErr(
-    "-ERR:3,msg:rocks.compaction_deletes_trigger can't be changed "
-    "dynmaically "
-    "in rocksdb(version < 6.11)\r\n");
-  EXPECT_EQ(err, expect.status().toString());
-#endif
 
   sess.setArgs({"CONFIG", "SET", "rocks.compaction_deletes_ratio", "0.5"});
   expect = Command::runSessionCmd(&sess);
-#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
   EXPECT_TRUE(expect.ok());
-#else
-  EXPECT_FALSE(expect.ok());
-  err.clear();
-  err = Command::fmtErr(
-    "-ERR:3,msg:rocks.compaction_deletes_ratio can't be changed dynmaically "
-    "in rocksdb(version < 6.11)\r\n");
-  EXPECT_EQ(err, expect.status().toString());
-#endif
 
-#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
   std::ostringstream tableProperties;
   tableProperties << "CompactOnDeletionCollector"
                   << " (Sliding window size = " << 100
@@ -2449,7 +2520,6 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
       }
     }
   }
-#endif
 
   sess.setArgs({"CONFIG", "SET", "rocks.abc", "-1"});
   expect = Command::runSessionCmd(&sess);
@@ -3082,11 +3152,11 @@ TEST(Command, testFlushallWithRocksDBPath) {
 
   const auto guard = MakeGuard([&walPath, &ec] {
     destroyEnv();
-    filesystem::remove_all(walPath, ec);
+    std::filesystem::remove_all(walPath, ec);
   });
 
   EXPECT_TRUE(setupEnv());
-  EXPECT_TRUE(filesystem::create_directory(walPath));
+  EXPECT_TRUE(std::filesystem::create_directory(walPath));
 
   auto cfg = makeServerParam();
   cfg->rocksWALDir = walPath;
