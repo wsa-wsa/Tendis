@@ -54,7 +54,8 @@ enum class TaskStatus {
   kCompleted = 4,   // 成功完成
   kFailed = 5,      // 执行失败
   kCancelled = 6,   // 已取消
-  kTimeout = 7      // 超时
+  kTimeout = 7,     // 超时
+  kRetrying = 8     // 重试中 (CaaS-LSM: 任务失败/超时后等待重新调度)
 };
 
 inline const char* TaskStatusToString(TaskStatus status) {
@@ -73,6 +74,8 @@ inline const char* TaskStatusToString(TaskStatus status) {
       return "Cancelled";
     case TaskStatus::kTimeout:
       return "Timeout";
+    case TaskStatus::kRetrying:
+      return "Retrying";
     default:
       return "Unknown";
   }
@@ -164,7 +167,12 @@ struct TaskInfo {
 
   bool CanRetry() const {
     return retry_count < max_retries &&
-           (status == TaskStatus::kFailed || status == TaskStatus::kTimeout);
+           (status == TaskStatus::kFailed || status == TaskStatus::kTimeout ||
+            status == TaskStatus::kRetrying);
+  }
+
+  bool IsRetrying() const {
+    return status == TaskStatus::kRetrying;
   }
 
   int64_t GetQueueTimeMs() const {

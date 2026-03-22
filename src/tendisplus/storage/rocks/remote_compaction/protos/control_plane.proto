@@ -114,6 +114,7 @@ enum TaskStatus {
   TASK_FAILED = 5;       // 执行失败
   TASK_CANCELLED = 6;    // 已取消
   TASK_TIMEOUT = 7;      // 超时
+  TASK_RETRYING = 8;     // 重试中 (CaaS-LSM: 等待重新调度)
 }
 
 // Worker 状态

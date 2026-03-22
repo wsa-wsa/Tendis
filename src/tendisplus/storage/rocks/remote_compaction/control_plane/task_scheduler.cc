@@ -577,14 +577,24 @@ std::shared_ptr<WorkerInfo> TaskScheduler::SelectWorker(const TaskInfo& task) {
 
 void TaskScheduler::HandleRetry(std::shared_ptr<TaskInfo> task) {
   task->retry_count++;
-  task->status = TaskStatus::kPending;
+
+  // CaaS-LSM: 先标记为 Retrying 状态，表示正在等待重新调度
+  task->status = TaskStatus::kRetrying;
   task->assigned_worker_id.clear();
 
-  std::cout << "[TaskScheduler] Task retry: " << task->task_id
+  std::cout << "[TaskScheduler] Task retrying: " << task->task_id
             << " (attempt " << task->retry_count << "/" << task->max_retries
             << ")" << std::endl;
 
-  // 重新入队
+  // 从运行队列移除（如果存在）
+  {
+    std::lock_guard<std::mutex> lock(running_mutex_);
+    running_tasks_.erase(task->task_id);
+  }
+
+  // 转为 Pending 状态并重新入队
+  task->status = TaskStatus::kPending;
+
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     pending_queue_.push(task);
@@ -688,9 +698,25 @@ bool TaskScheduler::DistributeTaskToCSA(const std::string& worker_id,
     return false;
   }
 
-  // TODO: 通过 gRPC 调用 CSA 的 DistributeCompactionJob 接口
-  // 这里需要实现 CSA 服务的客户端调用
-  // 在当前实现中，我们使用拉取模式，CSA 主动通过 FetchTask 获取任务
+  // 通过 WorkerManager 调用 CSA 的 DistributeCompactionJob gRPC 接口（推送模式）
+  bool success = worker_manager_->DistributeJobToCSA(
+    worker_id,
+    task->task_id,
+    task->params.compaction_args,
+    task->params.compaction_addition_info,
+    task->params.shared_fs_uri,
+    task->params.start_level,
+    task->params.score);
+
+  if (!success) {
+    std::cerr << "[TaskScheduler] Failed to distribute task to CSA: "
+              << task->task_id << " -> " << worker_id << std::endl;
+    return false;
+  }
+
+  // 更新任务状态为 Running
+  task->start_time = std::chrono::system_clock::now();
+  task->status = TaskStatus::kRunning;
 
   std::cout << "[TaskScheduler] Task distributed to CSA: " << task->task_id
             << " -> " << worker_id << std::endl;

@@ -10,6 +10,8 @@
 #include <sstream>
 #include <set>
 
+#include "control_plane.grpc.pb.h"
+
 namespace tendisplus {
 namespace control_plane {
 
@@ -505,15 +507,48 @@ bool WorkerManager::DistributeJobToCSA(const std::string& worker_id,
     return false;
   }
   
-  // TODO: 创建 CSAService::Stub 并调用 DistributeCompactionJob
-  // 由于 proto 文件尚未编译，这里只是框架代码
-  // 实际实现需要：
-  // 1. 创建 CSAService::Stub
-  // 2. 构建 DistributeJobRequest
-  // 3. 调用 stub->DistributeCompactionJob()
-  // 4. 处理响应
+  // 创建 CSAService::Stub 并调用 DistributeCompactionJob RPC
+  auto stub = control_plane::CSAService::NewStub(channel);
+  if (!stub) {
+    std::cerr << "[WorkerManager] Failed to create CSAService stub for: "
+              << worker->address << std::endl;
+    return false;
+  }
+
+  // 构建请求
+  control_plane::DistributeJobRequest request;
+  request.set_task_id(task_id);
+  request.set_compaction_args(compaction_args);
+  request.set_compaction_addition_info(compaction_addition_info);
+  request.set_shared_fs_uri(shared_fs_uri);
+  request.set_start_level(start_level);
+  request.set_score(score);
+
+  // 设置超时
+  grpc::ClientContext context;
+  auto deadline =
+    std::chrono::system_clock::now() + std::chrono::seconds(30);
+  context.set_deadline(deadline);
+
+  // 调用 RPC
+  control_plane::DistributeJobResponse response;
+  grpc::Status grpc_status =
+    stub->DistributeCompactionJob(&context, request, &response);
+
+  if (!grpc_status.ok()) {
+    std::cerr << "[WorkerManager] DistributeCompactionJob RPC failed: "
+              << grpc_status.error_message()
+              << " (worker=" << worker_id << ")" << std::endl;
+    return false;
+  }
+
+  if (!response.accepted()) {
+    std::cerr << "[WorkerManager] CSA rejected task: " << task_id
+              << ", reason: " << response.error_message() << std::endl;
+    return false;
+  }
   
-  std::cout << "[WorkerManager] DistributeJobToCSA: task=" << task_id
+  std::cout << "[WorkerManager] DistributeJobToCSA success: task=" << task_id
             << ", worker=" << worker_id << ", start_level=" << start_level
             << ", score=" << score << std::endl;
   
@@ -524,16 +559,57 @@ bool WorkerManager::CancelCSATask(const std::string& worker_id,
                                   const std::string& task_id) {
   auto worker = GetWorker(worker_id);
   if (!worker) {
+    std::cerr << "[WorkerManager] CancelCSATask: worker not found: "
+              << worker_id << std::endl;
     return false;
   }
   
   auto channel = GetOrCreateCSAChannel(worker->address);
   if (!channel) {
+    std::cerr << "[WorkerManager] CancelCSATask: failed to create channel to: "
+              << worker->address << std::endl;
     return false;
   }
   
-  // TODO: 调用 CSAService::CancelRunningTask
-  std::cout << "[WorkerManager] CancelCSATask: task=" << task_id
+  // 创建 CSAService::Stub 并调用 CancelRunningTask RPC
+  auto stub = control_plane::CSAService::NewStub(channel);
+  if (!stub) {
+    std::cerr << "[WorkerManager] CancelCSATask: failed to create stub for: "
+              << worker->address << std::endl;
+    return false;
+  }
+
+  // 构建请求
+  control_plane::CancelRunningTaskRequest request;
+  request.set_task_id(task_id);
+  request.set_reason("Cancelled by Control Plane");
+
+  // 设置超时
+  grpc::ClientContext context;
+  auto deadline =
+    std::chrono::system_clock::now() + std::chrono::seconds(10);
+  context.set_deadline(deadline);
+
+  // 调用 RPC
+  control_plane::CancelRunningTaskResponse response;
+  grpc::Status grpc_status =
+    stub->CancelRunningTask(&context, request, &response);
+
+  if (!grpc_status.ok()) {
+    std::cerr << "[WorkerManager] CancelRunningTask RPC failed: "
+              << grpc_status.error_message()
+              << " (worker=" << worker_id << ", task=" << task_id << ")"
+              << std::endl;
+    return false;
+  }
+
+  if (!response.success()) {
+    std::cerr << "[WorkerManager] CSA failed to cancel task: " << task_id
+              << ", reason: " << response.error_message() << std::endl;
+    return false;
+  }
+
+  std::cout << "[WorkerManager] CancelCSATask success: task=" << task_id
             << ", worker=" << worker_id << std::endl;
   
   return true;

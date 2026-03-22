@@ -5,14 +5,106 @@
 #include "control_plane_worker.h"
 
 #include <iostream>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 
 #include "control_plane.grpc.pb.h"
 #include "rocksdb/db.h"
 #include "rocksdb/db/compaction/compaction_job.h"
+#include "rocksdb/env.h"
+
+#include "tendisplus/storage/rocks/shared_filesystem.h"
 
 namespace tendisplus {
 namespace remote_compaction {
+
+// ============================================================================
+// SharedFileSystemCache - 共享文件系统缓存 (复用 csa_server.cc 逻辑)
+// 缓存已创建的共享文件系统实例，避免每次任务执行时重复创建
+// ============================================================================
+class SharedFileSystemCache {
+ public:
+  static SharedFileSystemCache& Instance() {
+    static SharedFileSystemCache instance;
+    return instance;
+  }
+
+  struct CachedFS {
+    std::shared_ptr<rocksdb::FileSystem> fs;
+    std::unique_ptr<rocksdb::Env> env;
+    std::string uri;
+    std::string local_prefix;
+  };
+
+  // 从 URI 获取或创建共享文件系统环境 (URI 模式)
+  // 返回 Env 指针 (nullptr 表示使用默认 Env)
+  rocksdb::Env* GetOrCreateEnvFromURI(const std::string& uri) {
+    if (uri.empty()) {
+      return nullptr;
+    }
+
+    std::string cache_key = "URI:" + uri;
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = cache_.find(cache_key);
+      if (it != cache_.end()) {
+        std::cout << "[CPWorker-FSCache] Reusing cached FileSystem for URI: "
+                  << uri << std::endl;
+        return it->second.env.get();
+      }
+    }
+
+    // 使用统一接口创建共享文件系统
+    // Worker 端使用纯 URI 模式 (无本地路径映射), local_prefix 为空
+    std::shared_ptr<rocksdb::FileSystem> shared_fs;
+    rocksdb::Status status = rocksdb::CreateSharedFileSystem(
+      rocksdb::FileSystem::Default(), uri, "" /* local_prefix */, &shared_fs);
+    if (!status.ok() || !shared_fs) {
+      std::cerr << "[CPWorker-FSCache] Failed to create shared filesystem "
+                << "from URI: " << uri
+                << ", error: " << status.ToString() << std::endl;
+      return nullptr;
+    }
+
+    std::unique_ptr<rocksdb::Env> env = rocksdb::NewCompositeEnv(shared_fs);
+    if (!env) {
+      std::cerr << "[CPWorker-FSCache] Failed to create Env from URI: "
+                << uri << std::endl;
+      return nullptr;
+    }
+
+    std::cout << "[CPWorker-FSCache] Created new FileSystem from URI: "
+              << uri << std::endl;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 双重检查：获取锁后再次检查
+    auto it = cache_.find(cache_key);
+    if (it != cache_.end()) {
+      return it->second.env.get();
+    }
+
+    CachedFS cached;
+    cached.fs = shared_fs;
+    cached.env = std::move(env);
+    cached.uri = uri;
+    cached.local_prefix = "";  // URI 模式不需要 local_prefix
+
+    rocksdb::Env* result = cached.env.get();
+    cache_[cache_key] = std::move(cached);
+    return result;
+  }
+
+ private:
+  SharedFileSystemCache() = default;
+  ~SharedFileSystemCache() = default;
+  SharedFileSystemCache(const SharedFileSystemCache&) = delete;
+  SharedFileSystemCache& operator=(const SharedFileSystemCache&) = delete;
+
+  std::unordered_map<std::string, CachedFS> cache_;
+  std::mutex mutex_;
+};
 
 ControlPlaneWorker::ControlPlaneWorker(const WorkerConfig& config)
   : config_(config) {
@@ -355,8 +447,23 @@ TaskExecutionResult ControlPlaneWorker::ExecuteCompaction(
   // 设置 compaction options
   ROCKSDB_NAMESPACE::CompactionServiceOptionsOverride options_override;
 
-  // TODO: 设置共享文件系统环境
-  // 这部分代码需要复用 csa_server.cc 中的 SharedFileSystemCache 逻辑
+  // 设置共享文件系统环境 (复用 SharedFileSystemCache 单例)
+  // 如果任务携带了 shared_fs_uri，则创建对应的共享文件系统 Env
+  // 使 OpenAndCompact 能够通过共享存储读写 SST 文件
+  if (!task.shared_fs_uri.empty()) {
+    rocksdb::Env* shared_env =
+      SharedFileSystemCache::Instance().GetOrCreateEnvFromURI(
+        task.shared_fs_uri);
+    if (shared_env) {
+      options_override.env = shared_env;
+      std::cout << "[ControlPlaneWorker] Using shared filesystem env for task: "
+                << task.task_id << ", URI: " << task.shared_fs_uri << std::endl;
+    } else {
+      std::cerr << "[ControlPlaneWorker] WARNING: Failed to create shared "
+                << "filesystem env for URI: " << task.shared_fs_uri
+                << ", falling back to default env" << std::endl;
+    }
+  }
 
   std::string compaction_output;
   std::string output_dir = task.db_name + "/" + std::to_string(task.job_id);
