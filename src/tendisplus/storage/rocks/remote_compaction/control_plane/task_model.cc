@@ -27,6 +27,9 @@ bool TaskFilter::Matches(const TaskInfo& task) const {
   if (status.has_value() && task.status != status.value()) {
     return false;
   }
+  if (task_type.has_value() && task.type != task_type.value()) {
+    return false;
+  }
   if (priority.has_value() && task.priority != priority.value()) {
     return false;
   }

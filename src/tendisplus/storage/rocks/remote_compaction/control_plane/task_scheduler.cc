@@ -111,6 +111,95 @@ std::string TaskScheduler::SubmitTask(const TaskInfo& task_info) {
   return task->task_id;
 }
 
+// =========================================================================
+// Bulk Load 任务管理
+// =========================================================================
+
+std::string TaskScheduler::SubmitBulkLoadTask(const TaskInfo& task_info) {
+  auto task = std::make_shared<TaskInfo>(task_info);
+
+  // 生成任务 ID
+  if (task->task_id.empty()) {
+    task->task_id = GenerateTaskId();
+  }
+
+  // 设置时间和类型
+  task->submit_time = std::chrono::system_clock::now();
+  task->status = TaskStatus::kPending;
+  task->type = TaskType::kBulkLoad;
+
+  // 添加到 Bulk Load 任务索引
+  {
+    std::lock_guard<std::mutex> lock(bulk_load_tasks_mutex_);
+    bulk_load_tasks_[task->task_id] = task;
+  }
+
+  // 添加到全局索引
+  {
+    std::lock_guard<std::mutex> lock(tasks_mutex_);
+    all_tasks_[task->task_id] = task;
+  }
+
+  statistics_.total_submitted++;
+
+  std::cout << "[TaskScheduler] Bulk Load task submitted: " << task->task_id
+            << " (source: " << task->bulk_load_params.source_path
+            << ", shards: " << task->bulk_load_params.shard_count << ")"
+            << std::endl;
+
+  return task->task_id;
+}
+
+std::string TaskScheduler::SubmitBulkLoadShard(const TaskInfo& shard_task) {
+  auto task = std::make_shared<TaskInfo>(shard_task);
+
+  // 生成分片任务 ID
+  if (task->task_id.empty()) {
+    task->task_id = GenerateTaskId();
+  }
+
+  task->submit_time = std::chrono::system_clock::now();
+  task->status = TaskStatus::kPending;
+  task->type = TaskType::kBulkLoad;
+
+  // 检查队列限制
+  {
+    std::lock_guard<std::mutex> lock(bulk_load_pending_mutex_);
+    if (bulk_load_pending_queue_.size() >= config_.max_pending_tasks) {
+      std::cerr << "[TaskScheduler] Bulk Load queue full, rejecting shard task"
+                << std::endl;
+      return "";
+    }
+    bulk_load_pending_queue_.push(task);
+  }
+
+  // 添加到全局索引
+  {
+    std::lock_guard<std::mutex> lock(tasks_mutex_);
+    all_tasks_[task->task_id] = task;
+  }
+
+  statistics_.pending_count++;
+
+  std::cout << "[TaskScheduler] Bulk Load shard submitted: " << task->task_id
+            << std::endl;
+
+  // 唤醒调度线程
+  cv_.notify_one();
+
+  return task->task_id;
+}
+
+std::shared_ptr<TaskInfo> TaskScheduler::GetBulkLoadTask(
+  const std::string& task_id) const {
+  std::lock_guard<std::mutex> lock(bulk_load_tasks_mutex_);
+  auto it = bulk_load_tasks_.find(task_id);
+  if (it != bulk_load_tasks_.end()) {
+    return it->second;
+  }
+  return nullptr;
+}
+
 bool TaskScheduler::CancelTask(const std::string& task_id,
                                const std::string& reason) {
   std::shared_ptr<TaskInfo> task;
@@ -526,6 +615,49 @@ std::vector<SchedulingDecision> TaskScheduler::DoSchedule() {
     HandleFallback(task, "Fallback condition met");
   }
 
+  // =====================================================================
+  // CaaS-LSM: Bulk Load 分片队列调度
+  // Bulk Load 分片优先级低于高紧急 Compaction，但仍按优先级和 FIFO 排序
+  // =====================================================================
+  if (!available_workers.empty()) {
+    std::lock_guard<std::mutex> bl_lock(bulk_load_pending_mutex_);
+    while (!bulk_load_pending_queue_.empty() && !available_workers.empty()) {
+      auto shard_task = bulk_load_pending_queue_.top();
+
+      // 选择可用 Worker
+      std::shared_ptr<WorkerInfo> bl_worker = nullptr;
+      for (const auto& w : available_workers) {
+        if (w->IsAvailable()) {
+          bl_worker = w;
+          break;
+        }
+      }
+      if (!bl_worker) {
+        break;
+      }
+
+      bulk_load_pending_queue_.pop();
+
+      SchedulingDecision decision;
+      decision.task_id = shard_task->task_id;
+      decision.worker_id = bl_worker->worker_id;
+      decision.should_schedule = true;
+      decision.reason = "BulkLoad shard scheduling";
+
+      decisions.push_back(decision);
+
+      // 更新可用 Worker 列表
+      available_workers.erase(
+        std::remove_if(available_workers.begin(),
+                       available_workers.end(),
+                       [&bl_worker](const std::shared_ptr<WorkerInfo>& w) {
+                         return w->worker_id == bl_worker->worker_id &&
+                                w->resources.AvailableSlots() <= 1;
+                       }),
+        available_workers.end());
+    }
+  }
+
   return decisions;
 }
 
@@ -556,7 +688,17 @@ void TaskScheduler::ExecuteDecisions(
       statistics_.pending_count--;
       statistics_.running_count++;
 
+      // CaaS-LSM: 根据任务类型选择推送模式
+      if (task->type == TaskType::kBulkLoad) {
+        // Bulk Load 分片通过推送模式分发
+        DistributeBulkLoadShardToCSA(decision.worker_id, task);
+      } else {
+        // Compaction 任务通过推送模式分发
+        DistributeTaskToCSA(decision.worker_id, task);
+      }
+
       std::cout << "[TaskScheduler] Task assigned: " << task->task_id
+                << " [" << TaskTypeToString(task->type) << "]"
                 << " -> " << decision.worker_id << std::endl;
     } else {
       // 分配失败，重新入队
@@ -720,6 +862,40 @@ bool TaskScheduler::DistributeTaskToCSA(const std::string& worker_id,
 
   std::cout << "[TaskScheduler] Task distributed to CSA: " << task->task_id
             << " -> " << worker_id << std::endl;
+
+  return true;
+}
+
+// CaaS-LSM: Bulk Load 分片分发到 CSA (推送模式)
+bool TaskScheduler::DistributeBulkLoadShardToCSA(
+  const std::string& worker_id,
+  std::shared_ptr<TaskInfo> shard_task) {
+  if (!worker_manager_) {
+    return false;
+  }
+
+  auto worker = worker_manager_->GetWorker(worker_id);
+  if (!worker) {
+    std::cerr << "[TaskScheduler] Worker not found for Bulk Load shard: "
+              << worker_id << std::endl;
+    return false;
+  }
+
+  // 检查 Worker 状态
+  if (worker->status != WorkerStatus::kOnline) {
+    std::cerr << "[TaskScheduler] Worker not online for Bulk Load: "
+              << worker_id << std::endl;
+    return false;
+  }
+
+  // TODO(Commit 3.2): 实际通过 gRPC 调用 CSA 的 ExecuteBulkLoadShard RPC
+  // 当前框架阶段只更新状态，实际 gRPC 调用在 Commit 3.2 实现
+  std::cout << "[TaskScheduler] Bulk Load shard distributed to CSA: "
+            << shard_task->task_id << " -> " << worker_id << std::endl;
+
+  // 更新任务状态为 Running
+  shard_task->start_time = std::chrono::system_clock::now();
+  shard_task->status = TaskStatus::kRunning;
 
   return true;
 }

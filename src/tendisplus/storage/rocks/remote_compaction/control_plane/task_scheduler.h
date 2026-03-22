@@ -108,10 +108,10 @@ class TaskScheduler {
   void SetWorkerManager(std::shared_ptr<WorkerManager> worker_manager);
 
   // =========================================================================
-  // 任务管理
+  // 任务管理 - Compaction
   // =========================================================================
 
-  // 提交任务
+  // 提交 Compaction 任务
   std::string SubmitTask(const TaskInfo& task_info);
 
   // 取消任务
@@ -122,6 +122,19 @@ class TaskScheduler {
 
   // 任务失败通知
   void OnTaskFailed(const std::string& task_id, const std::string& error);
+
+  // =========================================================================
+  // 任务管理 - Bulk Load
+  // =========================================================================
+
+  // 提交 Bulk Load 任务（整个 Bulk Load 作为一个 TaskInfo，内含多个 shard）
+  std::string SubmitBulkLoadTask(const TaskInfo& task_info);
+
+  // 提交 Bulk Load 分片子任务（由 BulkLoadCoordinator 调用）
+  std::string SubmitBulkLoadShard(const TaskInfo& shard_task);
+
+  // 查询 Bulk Load 任务及其分片状态
+  std::shared_ptr<TaskInfo> GetBulkLoadTask(const std::string& task_id) const;
 
   // =========================================================================
   // 任务查询
@@ -176,9 +189,13 @@ class TaskScheduler {
   // CaaS-LSM: 处理降级
   void HandleFallback(std::shared_ptr<TaskInfo> task, const std::string& reason);
 
-  // CaaS-LSM: 任务分发到 CSA (推送模式)
+  // CaaS-LSM: 任务分发到 CSA (推送模式 - Compaction)
   bool DistributeTaskToCSA(const std::string& worker_id,
                            std::shared_ptr<TaskInfo> task);
+
+  // CaaS-LSM: Bulk Load 分片分发到 CSA (推送模式)
+  bool DistributeBulkLoadShardToCSA(const std::string& worker_id,
+                                    std::shared_ptr<TaskInfo> shard_task);
 
   // ID 生成
   std::string GenerateTaskId();
@@ -214,6 +231,28 @@ class TaskScheduler {
                       TaskComparator>
     pending_queue_;
   mutable std::mutex pending_mutex_;
+
+  // Bulk Load 任务队列 (FIFO 调度，优先级低于高紧急 Compaction)
+  struct BulkLoadTaskComparator {
+    bool operator()(const std::shared_ptr<TaskInfo>& a,
+                    const std::shared_ptr<TaskInfo>& b) const {
+      // 先按优先级排序
+      if (a->priority != b->priority) {
+        return static_cast<int>(a->priority) < static_cast<int>(b->priority);
+      }
+      // 同优先级按提交时间 FIFO
+      return a->submit_time > b->submit_time;
+    }
+  };
+  std::priority_queue<std::shared_ptr<TaskInfo>,
+                      std::vector<std::shared_ptr<TaskInfo>>,
+                      BulkLoadTaskComparator>
+    bulk_load_pending_queue_;
+  mutable std::mutex bulk_load_pending_mutex_;
+
+  // Bulk Load 父任务索引 (task_id -> parent bulk load TaskInfo)
+  std::unordered_map<std::string, std::shared_ptr<TaskInfo>> bulk_load_tasks_;
+  mutable std::mutex bulk_load_tasks_mutex_;
 
   // 所有任务索引 (用于查询)
   std::unordered_map<std::string, std::shared_ptr<TaskInfo>> all_tasks_;

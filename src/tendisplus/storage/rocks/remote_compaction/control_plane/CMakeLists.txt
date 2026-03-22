@@ -40,7 +40,8 @@ add_library(control_plane_core STATIC
     task_model.cc
     worker_manager.cc
     task_scheduler.cc
-    control_plane.cc)
+    control_plane.cc
+    bulk_load_coordinator.cc)
 target_link_libraries(control_plane_core
     control_plane_grpc_proto
     ${_REFLECTION}

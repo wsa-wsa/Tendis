@@ -90,6 +90,31 @@ class ControlPlane {
                          uint32_t timeout_ms);
 
   // =========================================================================
+  // Bulk Load API - 批量加载管理
+  // =========================================================================
+
+  // 提交 Bulk Load 任务
+  std::string SubmitBulkLoadTask(const std::string& source_node_id,
+                                 const std::string& db_name,
+                                 const BulkLoadTaskParams& params,
+                                 TaskPriority priority = TaskPriority::kNormal);
+
+  // 查询 Bulk Load 状态（含分片进度）
+  std::shared_ptr<TaskInfo> QueryBulkLoadStatus(const std::string& task_id) const;
+
+  // 取消 Bulk Load 任务
+  bool CancelBulkLoad(const std::string& task_id, const std::string& reason = "");
+
+  // TendisPlus 上报 SST 注入结果
+  void ReportIngestResult(const std::string& task_id,
+                          const std::string& source_node_id,
+                          bool success,
+                          uint32_t ingested_sst_count,
+                          uint64_t ingested_bytes,
+                          uint64_t ingested_rows,
+                          const std::string& error_message);
+
+  // =========================================================================
   // CSA Worker API - Worker 管理
   // =========================================================================
 
@@ -165,6 +190,10 @@ class ControlPlane {
   // 核心组件
   std::shared_ptr<WorkerManager> worker_manager_;
   std::unique_ptr<TaskScheduler> scheduler_;
+
+  // Bulk Load 协调器 (前向声明, 在 control_plane.cc 中定义)
+  class BulkLoadCoordinatorImpl;
+  std::unique_ptr<BulkLoadCoordinatorImpl> bulk_load_coordinator_;
 
   // gRPC 服务器 (在实现文件中定义)
   class GrpcServer;

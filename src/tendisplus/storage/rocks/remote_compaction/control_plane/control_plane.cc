@@ -461,6 +461,153 @@ class ControlPlaneServiceImpl final
     return grpc::Status::OK;
   }
 
+  // =========================================================================
+  // Bulk Load API - 批量加载接口
+  // =========================================================================
+
+  grpc::Status SubmitBulkLoadTask(
+    grpc::ServerContext* context,
+    const ::control_plane::SubmitBulkLoadRequest* request,
+    ::control_plane::SubmitBulkLoadResponse* response) override {
+    // 转换 Proto 参数到内部类型
+    BulkLoadTaskParams params;
+    if (request->has_params()) {
+      const auto& p = request->params();
+      params.source_type = static_cast<DataSourceType>(p.source_type());
+      params.source_path = p.source_path();
+      params.data_format = static_cast<DataFormat>(p.data_format());
+      params.sharding_strategy = static_cast<ShardingStrategy>(p.sharding_strategy());
+      params.shard_count = p.shard_count();
+      params.target_store_id = p.target_store_id();
+      params.target_db_path = p.target_db_path();
+      params.shared_fs_uri = p.shared_fs_uri();
+      params.sst_output_dir = p.sst_output_dir();
+      params.compression = static_cast<CompressionType>(p.compression());
+      params.target_sst_size = p.target_sst_size();
+      params.generate_binlog = p.generate_binlog();
+      params.verify_checksum = p.verify_checksum();
+      params.timeout_sec = p.timeout_sec();
+      params.rate_limit_bytes_per_sec = p.rate_limit_bytes_per_sec();
+      params.max_concurrent_ingests = p.max_concurrent_ingests();
+
+      // 转换 key ranges
+      for (const auto& kr : p.key_ranges()) {
+        KeyRange range;
+        range.start_key = kr.start_key();
+        range.end_key = kr.end_key();
+        range.slot_start = kr.slot_start();
+        range.slot_end = kr.slot_end();
+        params.key_ranges.push_back(range);
+      }
+    }
+
+    auto priority = static_cast<TaskPriority>(request->priority());
+    std::string task_id = control_plane_.SubmitBulkLoadTask(
+      request->source_node_id(),
+      request->db_name(),
+      params,
+      priority);
+
+    if (task_id.empty()) {
+      response->set_success(false);
+      response->set_error_message("Failed to submit Bulk Load task");
+    } else {
+      response->set_success(true);
+      response->set_task_id(task_id);
+    }
+
+    return grpc::Status::OK;
+  }
+
+  grpc::Status QueryBulkLoadStatus(
+    grpc::ServerContext* context,
+    const ::control_plane::QueryBulkLoadRequest* request,
+    ::control_plane::QueryBulkLoadResponse* response) override {
+    auto task = control_plane_.QueryBulkLoadStatus(request->task_id());
+
+    if (!task) {
+      response->set_found(false);
+      return grpc::Status::OK;
+    }
+
+    response->set_found(true);
+    response->set_task_id(task->task_id);
+    response->set_overall_status(
+      static_cast<::control_plane::TaskStatus>(task->status));
+    response->set_phase(
+      static_cast<::control_plane::BulkLoadPhase>(task->bulk_load_params.phase));
+
+    // 分片统计
+    const auto& bl = task->bulk_load_params;
+    response->set_total_shards(bl.shards.size());
+    response->set_completed_shards(bl.completed_shards);
+    response->set_failed_shards(bl.failed_shards);
+
+    uint32_t running_shards = 0;
+    for (const auto& shard : bl.shards) {
+      auto* proto_shard = response->add_shards();
+      proto_shard->set_shard_id(shard.shard_id);
+      proto_shard->set_shard_index(shard.shard_index);
+      proto_shard->set_status(
+        static_cast<::control_plane::TaskStatus>(shard.status));
+      proto_shard->set_assigned_worker_id(shard.assigned_worker_id);
+      proto_shard->set_estimated_size(shard.estimated_size);
+      proto_shard->set_error_message(shard.error_message);
+
+      if (shard.status == TaskStatus::kRunning) {
+        running_shards++;
+      }
+
+      // SST 文件信息
+      for (const auto& sst : shard.generated_sst_files) {
+        auto* proto_sst = proto_shard->add_generated_sst_files();
+        proto_sst->set_file_path(sst.file_path);
+        proto_sst->set_column_family(sst.column_family);
+        proto_sst->set_file_size(sst.file_size);
+        proto_sst->set_num_entries(sst.num_entries);
+        proto_sst->set_checksum(sst.checksum);
+      }
+    }
+    response->set_running_shards(running_shards);
+
+    // 进度百分比
+    double total = bl.shards.size();
+    double done = bl.completed_shards;
+    response->set_progress_percent(total > 0 ? (done / total) * 100.0 : 0.0);
+
+    return grpc::Status::OK;
+  }
+
+  grpc::Status CancelBulkLoad(
+    grpc::ServerContext* context,
+    const ::control_plane::CancelBulkLoadRequest* request,
+    ::control_plane::CancelBulkLoadResponse* response) override {
+    bool success = control_plane_.CancelBulkLoad(
+      request->task_id(), request->reason());
+    response->set_success(success);
+    if (!success) {
+      response->set_error_message("Bulk Load task not found or already completed");
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status ReportIngestResult(
+    grpc::ServerContext* context,
+    const ::control_plane::ReportIngestResultRequest* request,
+    ::control_plane::ReportIngestResultResponse* response) override {
+    control_plane_.ReportIngestResult(
+      request->task_id(),
+      request->source_node_id(),
+      request->success(),
+      request->ingested_sst_count(),
+      request->ingested_bytes(),
+      request->ingested_rows(),
+      request->error_message());
+
+    response->set_success(true);
+    return grpc::Status::OK;
+  }
+
  private:
   ControlPlane& control_plane_;
 };
@@ -528,6 +675,9 @@ void ControlPlane::InitializeComponents() {
   // 创建 Task Scheduler
   scheduler_ = std::make_unique<TaskScheduler>(config_.scheduler_config);
   scheduler_->SetWorkerManager(worker_manager_);
+
+  // 创建 Bulk Load Coordinator
+  bulk_load_coordinator_ = std::make_unique<BulkLoadCoordinatorImpl>(*this);
 }
 
 void ControlPlane::Start() {
@@ -707,6 +857,196 @@ std::vector<std::shared_ptr<WorkerInfo>> ControlPlane::GetWorkers() const {
 
 const TaskStatistics& ControlPlane::GetTaskStatistics() const {
   return scheduler_->GetStatistics();
+}
+
+// =========================================================================
+// BulkLoadCoordinator Implementation (内嵌在 control_plane.cc 中)
+// =========================================================================
+class ControlPlane::BulkLoadCoordinatorImpl {
+ public:
+  explicit BulkLoadCoordinatorImpl(ControlPlane& cp) : control_plane_(cp) {}
+
+  // 执行分片规划（当前简化实现，后续 Commit 3.2 中完善）
+  void PlanShards(std::shared_ptr<TaskInfo> task) {
+    auto& params = task->bulk_load_params;
+    params.phase = BulkLoadPhase::kPlanning;
+
+    int32_t shard_count = params.shard_count > 0 ? params.shard_count : 4;
+
+    // 根据分片策略生成分片
+    for (int32_t i = 0; i < shard_count; i++) {
+      BulkLoadShardInfo shard;
+      shard.shard_id = task->task_id + "_shard_" + std::to_string(i);
+      shard.shard_index = i;
+      shard.status = TaskStatus::kPending;
+
+      // 简化分片：均匀分配 key 范围
+      if (!params.key_ranges.empty() && i < static_cast<int32_t>(params.key_ranges.size())) {
+        shard.key_range = params.key_ranges[i];
+      }
+
+      shard.source_path = params.source_path + "/shard_" + std::to_string(i);
+      params.shards.push_back(shard);
+    }
+
+    params.phase = BulkLoadPhase::kQueued;
+
+    std::cout << "[BulkLoadCoordinator] Planned " << shard_count
+              << " shards for task " << task->task_id << std::endl;
+  }
+
+  // 将分片作为子任务提交到调度器
+  void SubmitShardTasks(std::shared_ptr<TaskInfo> parent_task) {
+    auto& params = parent_task->bulk_load_params;
+
+    for (auto& shard : params.shards) {
+      TaskInfo shard_task;
+      shard_task.type = TaskType::kBulkLoad;
+      shard_task.priority = parent_task->priority;
+      shard_task.source_node_id = parent_task->source_node_id;
+      shard_task.db_name = parent_task->db_name;
+      shard_task.store_id = params.target_store_id;
+      shard_task.max_retries = parent_task->max_retries;
+
+      // 复制 Bulk Load 参数到分片任务
+      shard_task.bulk_load_params = params;
+      shard_task.bulk_load_params.shards.clear();  // 子任务不需要完整分片列表
+
+      auto shard_task_id = control_plane_.GetScheduler().SubmitBulkLoadShard(shard_task);
+      if (!shard_task_id.empty()) {
+        shard.status = TaskStatus::kPending;
+        std::cout << "[BulkLoadCoordinator] Shard " << shard.shard_id
+                  << " submitted as task " << shard_task_id << std::endl;
+      } else {
+        shard.status = TaskStatus::kFailed;
+        shard.error_message = "Failed to submit shard task";
+        params.failed_shards++;
+      }
+    }
+
+    params.phase = BulkLoadPhase::kSSTGenerating;
+  }
+
+  // 处理 SST 注入结果
+  void OnIngestResult(const std::string& task_id,
+                      bool success,
+                      uint32_t ingested_sst_count,
+                      uint64_t ingested_bytes,
+                      uint64_t ingested_rows,
+                      const std::string& error_message) {
+    auto task = control_plane_.GetScheduler().GetBulkLoadTask(task_id);
+    if (!task) {
+      std::cerr << "[BulkLoadCoordinator] Unknown task for ingest result: "
+                << task_id << std::endl;
+      return;
+    }
+
+    if (success) {
+      task->bulk_load_params.phase = BulkLoadPhase::kCompleted;
+      task->status = TaskStatus::kCompleted;
+      task->complete_time = std::chrono::system_clock::now();
+      task->result.success = true;
+      task->result.total_rows_processed = ingested_rows;
+      task->result.sst_files_count = ingested_sst_count;
+      task->result.bytes_written = ingested_bytes;
+      std::cout << "[BulkLoadCoordinator] Task " << task_id
+                << " ingest completed successfully" << std::endl;
+    } else {
+      task->bulk_load_params.phase = BulkLoadPhase::kFailed;
+      task->status = TaskStatus::kFailed;
+      task->complete_time = std::chrono::system_clock::now();
+      task->error_message = error_message;
+      task->result.success = false;
+      task->result.error_message = error_message;
+      std::cerr << "[BulkLoadCoordinator] Task " << task_id
+                << " ingest failed: " << error_message << std::endl;
+    }
+  }
+
+ private:
+  ControlPlane& control_plane_;
+};
+
+// =========================================================================
+// Bulk Load API Implementation
+// =========================================================================
+
+std::string ControlPlane::SubmitBulkLoadTask(
+  const std::string& source_node_id,
+  const std::string& db_name,
+  const BulkLoadTaskParams& params,
+  TaskPriority priority) {
+  TaskInfo task;
+  task.source_node_id = source_node_id;
+  task.db_name = db_name;
+  task.store_id = params.target_store_id;
+  task.priority = priority;
+  task.type = TaskType::kBulkLoad;
+  task.max_retries = config_.max_task_retries;
+  task.bulk_load_params = params;
+
+  // 提交到调度器
+  std::string task_id = scheduler_->SubmitBulkLoadTask(task);
+  if (task_id.empty()) {
+    return "";
+  }
+
+  // 执行分片规划并提交子任务
+  auto submitted_task = scheduler_->GetBulkLoadTask(task_id);
+  if (submitted_task && bulk_load_coordinator_) {
+    bulk_load_coordinator_->PlanShards(submitted_task);
+    bulk_load_coordinator_->SubmitShardTasks(submitted_task);
+  }
+
+  return task_id;
+}
+
+std::shared_ptr<TaskInfo> ControlPlane::QueryBulkLoadStatus(
+  const std::string& task_id) const {
+  return scheduler_->GetBulkLoadTask(task_id);
+}
+
+bool ControlPlane::CancelBulkLoad(const std::string& task_id,
+                                  const std::string& reason) {
+  auto task = scheduler_->GetBulkLoadTask(task_id);
+  if (!task) {
+    return false;
+  }
+
+  // 取消所有分片
+  uint32_t cancelled = 0;
+  for (auto& shard : task->bulk_load_params.shards) {
+    if (shard.status == TaskStatus::kPending ||
+        shard.status == TaskStatus::kRunning) {
+      shard.status = TaskStatus::kCancelled;
+      cancelled++;
+    }
+  }
+
+  task->bulk_load_params.phase = BulkLoadPhase::kCancelled;
+  task->status = TaskStatus::kCancelled;
+  task->error_message = reason;
+  task->complete_time = std::chrono::system_clock::now();
+
+  std::cout << "[ControlPlane] Bulk Load cancelled: " << task_id
+            << " (" << cancelled << " shards cancelled)" << std::endl;
+
+  return true;
+}
+
+void ControlPlane::ReportIngestResult(
+  const std::string& task_id,
+  const std::string& source_node_id,
+  bool success,
+  uint32_t ingested_sst_count,
+  uint64_t ingested_bytes,
+  uint64_t ingested_rows,
+  const std::string& error_message) {
+  if (bulk_load_coordinator_) {
+    bulk_load_coordinator_->OnIngestResult(
+      task_id, success, ingested_sst_count,
+      ingested_bytes, ingested_rows, error_message);
+  }
 }
 
 }  // namespace control_plane

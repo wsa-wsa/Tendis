@@ -75,6 +75,22 @@ service ControlPlaneService {
   
   // 获取 Worker 详情
   rpc GetWorkerDetail(WorkerDetailRequest) returns (WorkerDetailResponse);
+
+  // =========================================================================
+  // Bulk Load API - 批量加载接口
+  // =========================================================================
+  
+  // 提交 Bulk Load 任务
+  rpc SubmitBulkLoadTask(SubmitBulkLoadRequest) returns (SubmitBulkLoadResponse);
+  
+  // 查询 Bulk Load 任务状态 (含分片进度)
+  rpc QueryBulkLoadStatus(QueryBulkLoadRequest) returns (QueryBulkLoadResponse);
+  
+  // 取消 Bulk Load 任务
+  rpc CancelBulkLoad(CancelBulkLoadRequest) returns (CancelBulkLoadResponse);
+  
+  // TendisPlus 上报 SST 注入结果
+  rpc ReportIngestResult(ReportIngestResultRequest) returns (ReportIngestResultResponse);
 }
 
 // ============================================================================
@@ -90,6 +106,9 @@ service CSAService {
   
   // 取消正在执行的任务
   rpc CancelRunningTask(CancelRunningTaskRequest) returns (CancelRunningTaskResponse);
+
+  // 执行 Bulk Load 分片（SST 生成）
+  rpc ExecuteBulkLoadShard(BulkLoadShardRequest) returns (BulkLoadShardResponse);
 }
 
 // ============================================================================
@@ -467,4 +486,232 @@ message CancelRunningTaskRequest {
 message CancelRunningTaskResponse {
   bool success = 1;
   string error_message = 2;
+}
+
+// ============================================================================
+// Bulk Load Common Types - 批量加载公共类型
+// ============================================================================
+
+// 数据源类型
+enum DataSourceType {
+  DATA_SOURCE_KV_FILE = 0;       // 原始 KV 文件
+  DATA_SOURCE_SST_FILE = 1;      // 已有 SST 文件（直接注入）
+  DATA_SOURCE_RDB_FILE = 2;      // Redis RDB 文件
+  DATA_SOURCE_TENDIS_DUMP = 3;   // TendisPlus dump 文件
+  DATA_SOURCE_SNAPSHOT = 4;      // 另一个 TendisPlus 实例的快照
+}
+
+// 数据格式
+enum DataFormat {
+  FORMAT_TENDISPLUS_ENCODED = 0;  // TendisPlus RecordKey/RecordValue 编码
+  FORMAT_RAW_KV = 1;              // 原始 key-value（需要编码转换）
+  FORMAT_SST_NATIVE = 2;          // 原生 RocksDB SST 文件
+}
+
+// 分片策略
+enum ShardingStrategy {
+  SHARD_BY_KEY_RANGE = 0;     // 按 key 范围切分
+  SHARD_BY_SLOT = 1;          // 按 TendisPlus slot 切分
+  SHARD_BY_SIZE = 2;          // 按数据量均分
+  SHARD_AUTO = 3;             // 自动选择
+}
+
+// 压缩类型
+enum CompressionType {
+  COMPRESS_NONE = 0;
+  COMPRESS_SNAPPY = 1;
+  COMPRESS_ZLIB = 2;
+  COMPRESS_LZ4 = 3;
+  COMPRESS_ZSTD = 4;
+}
+
+// Bulk Load 阶段
+enum BulkLoadPhase {
+  PHASE_CREATED = 0;           // 任务已创建
+  PHASE_PLANNING = 1;          // 分片规划中
+  PHASE_QUEUED = 2;            // 子任务已入队
+  PHASE_SST_GENERATING = 3;    // SST 文件生成中
+  PHASE_INGESTING = 4;         // SST 文件注入中
+  PHASE_COMPLETED = 5;         // 完成
+  PHASE_FAILED = 6;            // 失败
+  PHASE_CANCELLED = 7;         // 已取消
+}
+
+// Key 范围
+message BulkLoadKeyRange {
+  bytes start_key = 1;     // 起始 key (inclusive)
+  bytes end_key = 2;       // 结束 key (exclusive)
+  uint32 slot_start = 3;   // 起始 slot
+  uint32 slot_end = 4;     // 结束 slot
+}
+
+// SST 文件元数据
+message SSTFileMetadataProto {
+  string file_path = 1;            // 共享存储上的 SST 文件路径
+  string column_family = 2;        // 目标 CF 名称 ("default" / "binlog")
+  uint64 file_size = 3;            // 文件大小 (bytes)
+  uint64 num_entries = 4;          // KV 条目数
+  bytes smallest_key = 5;          // 最小 key
+  bytes largest_key = 6;           // 最大 key
+  string checksum = 7;             // 文件校验和 (SHA256)
+}
+
+// Bulk Load 分片信息
+message BulkLoadShardInfoProto {
+  string shard_id = 1;
+  uint32 shard_index = 2;                 // 分片序号
+  BulkLoadKeyRange key_range = 3;         // 负责的 key 范围
+  string source_path = 4;                 // 数据源路径（分片后的子路径）
+  uint64 estimated_size = 5;              // 预估数据量 (bytes)
+  uint64 estimated_rows = 6;              // 预估行数
+  TaskStatus status = 7;                  // 分片执行状态
+  string assigned_worker_id = 8;          // 分配的 Worker
+  repeated SSTFileMetadataProto generated_sst_files = 9;  // 生成的 SST 文件
+  string error_message = 10;              // 错误信息
+}
+
+// Bulk Load 任务参数
+message BulkLoadTaskParamsProto {
+  // 数据源配置
+  DataSourceType source_type = 1;    // 数据源类型
+  string source_path = 2;            // 数据源路径/URI
+  DataFormat data_format = 3;        // 数据格式
+
+  // 分片配置
+  ShardingStrategy sharding_strategy = 4;  // 分片策略
+  int32 shard_count = 5;                   // 目标分片数 (0 = 自动)
+  repeated BulkLoadKeyRange key_ranges = 6;  // 手动指定的 key 范围
+
+  // 目标配置
+  uint32 target_store_id = 7;        // 目标 store ID
+  string target_db_path = 8;         // 目标 DB 路径
+  string shared_fs_uri = 9;          // 共享文件系统 URI
+  string sst_output_dir = 10;        // SST 输出目录（共享存储上）
+
+  // 执行配置
+  CompressionType compression = 11;  // SST 压缩算法
+  uint64 target_sst_size = 12;      // 目标 SST 文件大小 (bytes)
+  bool generate_binlog = 13;         // 是否生成 binlog SST
+  bool verify_checksum = 14;         // 注入前校验
+  uint32 timeout_sec = 15;           // 超时时间 (秒)
+
+  // 资源控制
+  int64 rate_limit_bytes_per_sec = 16;  // 速率限制 (0 = 不限制)
+  int32 max_concurrent_ingests = 17;    // 最大并发注入数
+
+  // 状态信息
+  BulkLoadPhase phase = 18;           // 当前阶段
+  repeated BulkLoadShardInfoProto shards = 19;  // 分片列表
+  uint32 completed_shards = 20;       // 已完成分片数
+  uint32 failed_shards = 21;          // 失败分片数
+}
+
+// ============================================================================
+// Bulk Load API Messages - 批量加载接口消息
+// ============================================================================
+
+// 提交 Bulk Load 任务请求
+message SubmitBulkLoadRequest {
+  string source_node_id = 1;            // TendisPlus 节点 ID
+  string db_name = 2;                   // 数据库名称
+  BulkLoadTaskParamsProto params = 3;   // Bulk Load 参数
+  TaskPriority priority = 4;            // 任务优先级
+}
+
+message SubmitBulkLoadResponse {
+  bool success = 1;
+  string task_id = 2;                   // 分配的任务 ID
+  string error_message = 3;
+}
+
+// 查询 Bulk Load 状态请求
+message QueryBulkLoadRequest {
+  string task_id = 1;
+}
+
+message QueryBulkLoadResponse {
+  bool found = 1;
+  string task_id = 2;
+  TaskStatus overall_status = 3;           // 整体任务状态
+  BulkLoadPhase phase = 4;                 // 当前阶段
+  uint32 total_shards = 5;                 // 总分片数
+  uint32 completed_shards = 6;             // 已完成分片数
+  uint32 failed_shards = 7;               // 失败分片数
+  uint32 running_shards = 8;              // 进行中分片数
+  repeated BulkLoadShardInfoProto shards = 9;  // 分片详情
+  repeated SSTFileMetadataProto all_sst_files = 10;  // 所有生成的 SST 文件
+  double progress_percent = 11;            // 进度百分比
+  string error_message = 12;
+}
+
+// 取消 Bulk Load 请求
+message CancelBulkLoadRequest {
+  string task_id = 1;
+  string reason = 2;
+}
+
+message CancelBulkLoadResponse {
+  bool success = 1;
+  string error_message = 2;
+  uint32 cancelled_shards = 3;            // 已取消的分片数
+}
+
+// TendisPlus 上报 SST 注入结果请求
+message ReportIngestResultRequest {
+  string task_id = 1;
+  string source_node_id = 2;             // TendisPlus 节点 ID
+  bool success = 3;                       // 注入是否成功
+  uint32 ingested_sst_count = 4;         // 已注入的 SST 文件数
+  uint64 ingested_bytes = 5;              // 已注入的数据量 (bytes)
+  uint64 ingested_rows = 6;              // 已注入的行数
+  string error_message = 7;              // 失败时的错误信息
+  uint64 ingest_time_ms = 8;             // 注入耗时 (毫秒)
+}
+
+message ReportIngestResultResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// ============================================================================
+// CSA Bulk Load Shard Execution Messages
+// ============================================================================
+
+// 执行 Bulk Load 分片请求 (Control Plane → CSA Worker 推送模式)
+message BulkLoadShardRequest {
+  string task_id = 1;                     // 父任务 ID
+  string shard_id = 2;                    // 分片 ID
+  uint32 shard_index = 3;                 // 分片序号
+
+  // 数据源信息
+  DataSourceType source_type = 4;
+  string source_path = 5;                // 数据源路径
+  DataFormat data_format = 6;
+
+  // Key 范围
+  BulkLoadKeyRange key_range = 7;
+
+  // SST 生成配置
+  string shared_fs_uri = 8;              // 共享文件系统 URI
+  string sst_output_dir = 9;             // SST 输出目录
+  CompressionType compression = 10;
+  uint64 target_sst_size = 11;           // 目标 SST 文件大小
+  bool generate_binlog = 12;             // 是否生成 binlog SST
+  uint32 target_store_id = 13;           // 目标 store ID
+  string target_db_path = 14;            // 目标 DB 路径
+
+  // 资源控制
+  int64 rate_limit_bytes_per_sec = 15;
+  uint32 timeout_sec = 16;
+}
+
+message BulkLoadShardResponse {
+  bool accepted = 1;                      // 是否接受任务
+  string error_message = 2;
+
+  // 生成结果（异步完成后通过 ReportTaskResult 上报详细结果）
+  repeated SSTFileMetadataProto generated_sst_files = 3;
+  uint64 total_rows_processed = 4;
+  uint64 total_bytes_written = 5;
+  uint64 execution_time_ms = 6;
 }
