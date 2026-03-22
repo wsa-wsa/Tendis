@@ -124,6 +124,14 @@ class Observatory {
   std::string HandleApiTaskDetail(const std::string& task_id);
   std::string HandleApiClusterStatus();
   std::string HandleApiConnectionStatus();
+
+  // 增强观测 API 处理器
+  std::string HandleApiAlerts();
+  std::string HandleApiAlertRules();
+  std::string HandleApiTraces(const std::string& query_type);
+  std::string HandleApiTraceDetail(const std::string& task_id);
+  std::string HandleApiPrometheusMetrics();
+  std::string HandleApiBulkLoadStatus(const std::string& task_id);
   
   // 静态文件处理
   std::string HandleStaticFile(const std::string& path);

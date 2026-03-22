@@ -290,6 +290,44 @@ std::string Observatory::HandleRequest(const std::string& method,
     return BuildJsonResponse(HandleApiClusterStatus());
   }
 
+  // 增强观测 API
+  if (path == "/api/alerts" || path == "/api/alerts/") {
+    return BuildJsonResponse(HandleApiAlerts());
+  }
+  if (path == "/api/alert-rules" || path == "/api/alert-rules/") {
+    return BuildJsonResponse(HandleApiAlertRules());
+  }
+  if (path == "/api/traces" || path == "/api/traces/") {
+    return BuildJsonResponse(HandleApiTraces("recent"));
+  }
+  if (path.find("/api/traces?") == 0) {
+    std::string query_type = "recent";
+    if (path.find("type=slow") != std::string::npos) {
+      query_type = "slow";
+    } else if (path.find("type=failed") != std::string::npos) {
+      query_type = "failed";
+    }
+    return BuildJsonResponse(HandleApiTraces(query_type));
+  }
+  if (path.find("/api/trace/") == 0 && path.size() > 11) {
+    std::string task_id = path.substr(11);
+    if (!task_id.empty() && task_id.back() == '/') {
+      task_id.pop_back();
+    }
+    return BuildJsonResponse(HandleApiTraceDetail(task_id));
+  }
+  if (path == "/api/prometheus/metrics" || path == "/api/prometheus/metrics/") {
+    return BuildHttpResponse(200, "text/plain; charset=utf-8",
+                             HandleApiPrometheusMetrics());
+  }
+  if (path.find("/api/bulkload/") == 0 && path.size() > 14) {
+    std::string task_id = path.substr(14);
+    if (!task_id.empty() && task_id.back() == '/') {
+      task_id.pop_back();
+    }
+    return BuildJsonResponse(HandleApiBulkLoadStatus(task_id));
+  }
+
   // 静态文件
   if (path == "/" || path == "/index.html") {
     return BuildHttpResponse(200, "text/html; charset=utf-8", GetEmbeddedHtml());
@@ -690,6 +728,352 @@ std::string Observatory::HandleApiClusterStatus() {
     return json.str();
   } catch (const std::exception& e) {
     return R"({"error": ")" + JsonEscape(e.what()) + R"("})";
+  }
+}
+
+// ============================================================================
+// 增强观测 API 处理器
+// ============================================================================
+
+std::string Observatory::HandleApiAlerts() {
+  if (!connected_.load() || !stub_) {
+    return R"({"error": "Not connected to Control Plane"})";
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(grpc_mutex_);
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() +
+                        std::chrono::milliseconds(config_.grpc_timeout_ms));
+
+    ::control_plane::GetAlertsRequest request;
+    request.set_active_only(false);
+    request.set_history_limit(50);
+    ::control_plane::GetAlertsResponse response;
+
+    auto status = stub_->GetAlerts(&context, request, &response);
+    if (!status.ok()) {
+      return R"({"error": "Failed to fetch alerts"})";
+    }
+
+    std::ostringstream json;
+    json << "{";
+    json << R"("total_active":)" << response.total_active() << ",";
+    json << R"("info_count":)" << response.info_count() << ",";
+    json << R"("warning_count":)" << response.warning_count() << ",";
+    json << R"("critical_count":)" << response.critical_count() << ",";
+    json << R"("active_alerts":[)";
+
+    bool first = true;
+    for (const auto& a : response.active_alerts()) {
+      if (!first) json << ",";
+      first = false;
+      json << "{";
+      json << R"("event_id":")" << JsonEscape(a.event_id()) << "\",";
+      json << R"("rule_name":")" << JsonEscape(a.rule_name()) << "\",";
+      json << R"("severity":")" << JsonEscape(
+        a.severity() == ::control_plane::ALERT_CRITICAL ? "Critical" :
+        a.severity() == ::control_plane::ALERT_WARNING ? "Warning" : "Info") << "\",";
+      json << R"("metric":")" << JsonEscape(a.metric()) << "\",";
+      json << R"("current_value":)" << a.current_value() << ",";
+      json << R"("threshold":)" << a.threshold() << ",";
+      json << R"("operator":")" << JsonEscape(a.operator_str()) << "\",";
+      json << R"("timestamp_ms":)" << a.timestamp_ms() << ",";
+      json << R"("message":")" << JsonEscape(a.message()) << "\"";
+      json << "}";
+    }
+    json << "],";
+
+    json << R"("alert_history":[)";
+    first = true;
+    for (const auto& a : response.alert_history()) {
+      if (!first) json << ",";
+      first = false;
+      json << "{";
+      json << R"("event_id":")" << JsonEscape(a.event_id()) << "\",";
+      json << R"("rule_name":")" << JsonEscape(a.rule_name()) << "\",";
+      json << R"("severity":")" << JsonEscape(
+        a.severity() == ::control_plane::ALERT_CRITICAL ? "Critical" :
+        a.severity() == ::control_plane::ALERT_WARNING ? "Warning" : "Info") << "\",";
+      json << R"("state":")" << JsonEscape(
+        a.state() == ::control_plane::ALERT_FIRING ? "Firing" :
+        a.state() == ::control_plane::ALERT_RESOLVED ? "Resolved" : "Inactive") << "\",";
+      json << R"("metric":")" << JsonEscape(a.metric()) << "\",";
+      json << R"("current_value":)" << a.current_value() << ",";
+      json << R"("timestamp_ms":)" << a.timestamp_ms() << ",";
+      json << R"("message":")" << JsonEscape(a.message()) << "\"";
+      json << "}";
+    }
+    json << "]}";
+
+    return json.str();
+  } catch (const std::exception& e) {
+    return R"({"error": ")" + JsonEscape(e.what()) + R"("})";
+  }
+}
+
+std::string Observatory::HandleApiAlertRules() {
+  if (!connected_.load() || !stub_) {
+    return R"({"error": "Not connected to Control Plane", "rules": []})";
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(grpc_mutex_);
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() +
+                        std::chrono::milliseconds(config_.grpc_timeout_ms));
+
+    ::control_plane::GetAlertRulesRequest request;
+    ::control_plane::GetAlertRulesResponse response;
+
+    auto status = stub_->GetAlertRules(&context, request, &response);
+    if (!status.ok()) {
+      return R"({"error": "Failed to fetch alert rules", "rules": []})";
+    }
+
+    std::ostringstream json;
+    json << "{\"rules\":[";
+
+    bool first = true;
+    for (const auto& r : response.rules()) {
+      if (!first) json << ",";
+      first = false;
+      json << "{";
+      json << R"("rule_id":")" << JsonEscape(r.rule_id()) << "\",";
+      json << R"("name":")" << JsonEscape(r.name()) << "\",";
+      json << R"("description":")" << JsonEscape(r.description()) << "\",";
+      json << R"("metric":")" << JsonEscape(r.metric()) << "\",";
+      json << R"("operator":")" << JsonEscape(r.operator_str()) << "\",";
+      json << R"("threshold":)" << r.threshold() << ",";
+      json << R"("severity":")" << JsonEscape(
+        r.severity() == ::control_plane::ALERT_CRITICAL ? "Critical" :
+        r.severity() == ::control_plane::ALERT_WARNING ? "Warning" : "Info") << "\",";
+      json << R"("duration_sec":)" << r.duration_sec() << ",";
+      json << R"("enabled":)" << (r.enabled() ? "true" : "false") << ",";
+      json << R"("state":")" << JsonEscape(
+        r.state() == ::control_plane::ALERT_FIRING ? "Firing" :
+        r.state() == ::control_plane::ALERT_RESOLVED ? "Resolved" : "Inactive") << "\",";
+      json << R"("last_value":)" << r.last_value();
+      json << "}";
+    }
+    json << "]}";
+
+    return json.str();
+  } catch (const std::exception& e) {
+    return R"({"error": ")" + JsonEscape(e.what()) + R"(", "rules": []})";
+  }
+}
+
+std::string Observatory::HandleApiTraces(const std::string& query_type) {
+  if (!connected_.load() || !stub_) {
+    return R"({"error": "Not connected to Control Plane", "traces": []})";
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(grpc_mutex_);
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() +
+                        std::chrono::milliseconds(config_.grpc_timeout_ms));
+
+    ::control_plane::GetRecentTracesRequest request;
+    request.set_limit(50);
+    if (query_type == "slow") {
+      request.set_slow_only(true);
+      request.set_slow_threshold_ms(10000);
+    } else if (query_type == "failed") {
+      request.set_failed_only(true);
+    }
+
+    ::control_plane::GetRecentTracesResponse response;
+    auto status = stub_->GetRecentTraces(&context, request, &response);
+    if (!status.ok()) {
+      return R"({"error": "Failed to fetch traces", "traces": []})";
+    }
+
+    std::ostringstream json;
+    json << "{";
+    json << R"("total_traces":)" << response.total_traces() << ",";
+    json << R"("active_traces":)" << response.active_traces() << ",";
+    json << R"("traces":[)";
+
+    bool first = true;
+    for (const auto& t : response.traces()) {
+      if (!first) json << ",";
+      first = false;
+      json << "{";
+      json << R"("trace_id":")" << JsonEscape(t.trace_id()) << "\",";
+      json << R"("task_type":")" << JsonEscape(t.task_type()) << "\",";
+      json << R"("source_node":")" << JsonEscape(t.source_node_id()) << "\",";
+      json << R"("start_time_ms":)" << t.start_time_ms() << ",";
+      json << R"("total_duration_ms":)" << t.total_duration_ms() << ",";
+      json << R"("is_complete":)" << (t.is_complete() ? "true" : "false") << ",";
+      json << R"("final_status":")" << JsonEscape(t.final_status()) << "\",";
+      json << R"("queue_duration_ms":)" << t.queue_duration_ms() << ",";
+      json << R"("schedule_duration_ms":)" << t.schedule_duration_ms() << ",";
+      json << R"("execute_duration_ms":)" << t.execute_duration_ms() << ",";
+      json << R"("transfer_duration_ms":)" << t.transfer_duration_ms() << ",";
+      json << R"("span_count":)" << t.spans_size();
+      json << "}";
+    }
+    json << "]}";
+
+    return json.str();
+  } catch (const std::exception& e) {
+    return R"({"error": ")" + JsonEscape(e.what()) + R"(", "traces": []})";
+  }
+}
+
+std::string Observatory::HandleApiTraceDetail(const std::string& task_id) {
+  if (!connected_.load() || !stub_) {
+    return R"({"error": "Not connected to Control Plane", "found": false})";
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(grpc_mutex_);
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() +
+                        std::chrono::milliseconds(config_.grpc_timeout_ms));
+
+    ::control_plane::GetTaskTraceRequest request;
+    request.set_task_id(task_id);
+    ::control_plane::GetTaskTraceResponse response;
+
+    auto status = stub_->GetTaskTrace(&context, request, &response);
+    if (!status.ok()) {
+      return R"({"error": "Failed to fetch trace", "found": false})";
+    }
+
+    if (!response.found()) {
+      return R"({"found": false})";
+    }
+
+    const auto& t = response.trace();
+    std::ostringstream json;
+    json << "{\"found\":true,\"trace\":{";
+    json << R"("trace_id":")" << JsonEscape(t.trace_id()) << "\",";
+    json << R"("task_type":")" << JsonEscape(t.task_type()) << "\",";
+    json << R"("source_node":")" << JsonEscape(t.source_node_id()) << "\",";
+    json << R"("start_time_ms":)" << t.start_time_ms() << ",";
+    json << R"("end_time_ms":)" << t.end_time_ms() << ",";
+    json << R"("total_duration_ms":)" << t.total_duration_ms() << ",";
+    json << R"("is_complete":)" << (t.is_complete() ? "true" : "false") << ",";
+    json << R"("final_status":")" << JsonEscape(t.final_status()) << "\",";
+    json << R"("queue_duration_ms":)" << t.queue_duration_ms() << ",";
+    json << R"("schedule_duration_ms":)" << t.schedule_duration_ms() << ",";
+    json << R"("execute_duration_ms":)" << t.execute_duration_ms() << ",";
+    json << R"("transfer_duration_ms":)" << t.transfer_duration_ms() << ",";
+    json << R"("spans":[)";
+
+    bool first = true;
+    for (const auto& s : t.spans()) {
+      if (!first) json << ",";
+      first = false;
+      json << "{";
+      json << R"("span_id":")" << JsonEscape(s.span_id()) << "\",";
+      json << R"("parent_span_id":")" << JsonEscape(s.parent_span_id()) << "\",";
+      json << R"("operation":")" << JsonEscape(s.operation()) << "\",";
+      json << R"("component":")" << JsonEscape(s.component()) << "\",";
+      json << R"("worker_id":")" << JsonEscape(s.worker_id()) << "\",";
+      json << R"("start_time_ms":)" << s.start_time_ms() << ",";
+      json << R"("end_time_ms":)" << s.end_time_ms() << ",";
+      json << R"("duration_ms":)" << s.duration_ms() << ",";
+      json << R"("status":")" << JsonEscape(s.status()) << "\",";
+      json << R"("error_message":")" << JsonEscape(s.error_message()) << "\"";
+      json << "}";
+    }
+    json << "]}}";
+
+    return json.str();
+  } catch (const std::exception& e) {
+    return R"({"error": ")" + JsonEscape(e.what()) + R"(", "found": false})";
+  }
+}
+
+std::string Observatory::HandleApiPrometheusMetrics() {
+  if (!connected_.load() || !stub_) {
+    return "# Observatory not connected to Control Plane\n";
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(grpc_mutex_);
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() +
+                        std::chrono::milliseconds(config_.grpc_timeout_ms));
+
+    ::control_plane::PrometheusMetricsRequest request;
+    ::control_plane::PrometheusMetricsResponse response;
+
+    auto status = stub_->GetPrometheusMetrics(&context, request, &response);
+    if (!status.ok()) {
+      return "# Failed to fetch Prometheus metrics from Control Plane\n";
+    }
+
+    return response.metrics_text();
+  } catch (const std::exception& e) {
+    return std::string("# Error: ") + e.what() + "\n";
+  }
+}
+
+std::string Observatory::HandleApiBulkLoadStatus(const std::string& task_id) {
+  if (!connected_.load() || !stub_) {
+    return R"({"error": "Not connected to Control Plane", "found": false})";
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(grpc_mutex_);
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() +
+                        std::chrono::milliseconds(config_.grpc_timeout_ms));
+
+    ::control_plane::QueryBulkLoadRequest request;
+    request.set_task_id(task_id);
+    ::control_plane::QueryBulkLoadResponse response;
+
+    auto status = stub_->QueryBulkLoadStatus(&context, request, &response);
+    if (!status.ok()) {
+      return R"({"error": "Failed to fetch Bulk Load status", "found": false})";
+    }
+
+    if (!response.found()) {
+      return R"({"found": false})";
+    }
+
+    std::ostringstream json;
+    json << "{\"found\":true,";
+    json << R"("task_id":")" << JsonEscape(response.task_id()) << "\",";
+    json << R"("status":")" << TaskStatusToJsonString(response.overall_status()) << "\",";
+    json << R"("phase":)" << response.phase() << ",";
+    json << R"("total_shards":)" << response.total_shards() << ",";
+    json << R"("completed_shards":)" << response.completed_shards() << ",";
+    json << R"("failed_shards":)" << response.failed_shards() << ",";
+    json << R"("running_shards":)" << response.running_shards() << ",";
+    json << R"("progress_percent":)" << std::fixed << std::setprecision(1)
+         << response.progress_percent() << ",";
+    json << R"("shards":[)";
+
+    bool first = true;
+    for (const auto& s : response.shards()) {
+      if (!first) json << ",";
+      first = false;
+      json << "{";
+      json << R"("shard_id":")" << JsonEscape(s.shard_id()) << "\",";
+      json << R"("shard_index":)" << s.shard_index() << ",";
+      json << R"("status":")" << TaskStatusToJsonString(s.status()) << "\",";
+      json << R"("worker":")" << JsonEscape(s.assigned_worker_id()) << "\",";
+      json << R"("sst_count":)" << s.generated_sst_files_size();
+      json << "}";
+    }
+    json << "]}";
+
+    return json.str();
+  } catch (const std::exception& e) {
+    return R"({"error": ")" + JsonEscape(e.what()) + R"(", "found": false})";
   }
 }
 
@@ -1143,6 +1527,47 @@ std::string Observatory::GetEmbeddedHtml() {
         .tab-btn:hover:not(.active) {
             background: rgba(255,255,255,0.15);
         }
+        .alert-badge {
+            padding: 6px 14px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+        .alert-badge.info { background: rgba(79,195,247,0.2); color: #4fc3f7; }
+        .alert-badge.warning { background: rgba(255,183,77,0.2); color: #ffb74d; }
+        .alert-badge.critical { background: rgba(229,115,115,0.2); color: #e57373; }
+        .alert-item {
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+            padding: 10px 15px;
+            margin-bottom: 8px;
+            border-left: 4px solid #4fc3f7;
+        }
+        .alert-item.Warning { border-left-color: #ffb74d; }
+        .alert-item.Critical { border-left-color: #e57373; }
+        .alert-item .alert-title {
+            font-weight: 600;
+            font-size: 0.9em;
+        }
+        .alert-item .alert-detail {
+            font-size: 0.8em;
+            color: #90a4ae;
+            margin-top: 4px;
+        }
+        .trace-phases {
+            display: flex;
+            gap: 2px;
+            margin-top: 6px;
+            height: 6px;
+        }
+        .trace-phase {
+            border-radius: 3px;
+            min-width: 4px;
+        }
+        .trace-phase.queue { background: #ce93d8; }
+        .trace-phase.schedule { background: #4fc3f7; }
+        .trace-phase.execute { background: #81c784; }
+        .trace-phase.transfer { background: #ffb74d; }
         .disconnected-overlay {
             position: fixed;
             top: 0;
@@ -1282,6 +1707,19 @@ std::string Observatory::GetEmbeddedHtml() {
             </div>
         </div>
 
+        <!-- Alert Panel -->
+        <div class="card" id="alertPanel" style="margin-bottom:20px;">
+            <h3>🔔 Alerts</h3>
+            <div class="alert-summary" style="display:flex;gap:15px;margin-bottom:15px;">
+                <div class="alert-badge info" id="alertInfoCount">0 Info</div>
+                <div class="alert-badge warning" id="alertWarningCount">0 Warning</div>
+                <div class="alert-badge critical" id="alertCriticalCount">0 Critical</div>
+            </div>
+            <div class="alert-list" id="alertList" style="max-height:200px;overflow-y:auto;">
+                <div style="color:#607d8b;padding:10px;">No active alerts</div>
+            </div>
+        </div>
+
         <!-- Bottom Grid -->
         <div class="grid">
             <!-- Task List -->
@@ -1306,6 +1744,23 @@ std::string Observatory::GetEmbeddedHtml() {
                 <div class="worker-list" id="workerList">
                     <div class="worker-item">Loading...</div>
                 </div>
+            </div>
+        </div>
+
+        <!-- Traces Grid -->
+        <div class="card" style="margin-bottom:20px;">
+            <h3>🔍 Task Traces</h3>
+            <div class="tab-buttons">
+                <button class="tab-btn active" data-trace-type="recent" onclick="switchTraceTab(this,'recent')">Recent</button>
+                <button class="tab-btn" data-trace-type="slow" onclick="switchTraceTab(this,'slow')">Slow</button>
+                <button class="tab-btn" data-trace-type="failed" onclick="switchTraceTab(this,'failed')">Failed</button>
+            </div>
+            <div style="display:flex;gap:10px;margin-bottom:10px;font-size:0.85em;color:#90a4ae;">
+                <span>Total Traces: <strong id="totalTraces">0</strong></span>
+                <span>Active: <strong id="activeTraces">0</strong></span>
+            </div>
+            <div class="task-list" id="traceList" style="max-height:300px;">
+                <div class="task-item"><div class="task-info">Loading...</div></div>
             </div>
         </div>
 
@@ -1584,6 +2039,89 @@ std::string Observatory::GetEmbeddedHtml() {
             return (ms/60000).toFixed(1) + 'm';
         }
 
+        let currentTraceType = 'recent';
+
+        async function fetchAlerts() {
+            try {
+                const res = await fetch('/api/alerts');
+                const data = await res.json();
+                if (data.error) return;
+
+                document.getElementById('alertInfoCount').textContent = (data.info_count || 0) + ' Info';
+                document.getElementById('alertWarningCount').textContent = (data.warning_count || 0) + ' Warning';
+                document.getElementById('alertCriticalCount').textContent = (data.critical_count || 0) + ' Critical';
+
+                const list = document.getElementById('alertList');
+                const alerts = data.active_alerts || [];
+                if (alerts.length === 0) {
+                    list.innerHTML = '<div style="color:#607d8b;padding:10px;">✅ No active alerts</div>';
+                    return;
+                }
+
+                list.innerHTML = alerts.map(a => `
+                    <div class="alert-item ${a.severity}">
+                        <div class="alert-title">${a.severity === 'Critical' ? '🔴' : a.severity === 'Warning' ? '🟡' : 'ℹ️'} ${a.rule_name}</div>
+                        <div class="alert-detail">${a.message} (${a.metric}: ${a.current_value.toFixed(1)} ${a.operator} ${a.threshold})</div>
+                    </div>
+                `).join('');
+            } catch (e) {
+                console.error('Failed to fetch alerts:', e);
+            }
+        }
+
+        async function fetchTraces(type) {
+            try {
+                const url = type === 'recent' ? '/api/traces' : `/api/traces?type=${type}`;
+                const res = await fetch(url);
+                const data = await res.json();
+                if (data.error) return;
+
+                document.getElementById('totalTraces').textContent = data.total_traces || 0;
+                document.getElementById('activeTraces').textContent = data.active_traces || 0;
+
+                const list = document.getElementById('traceList');
+                const traces = data.traces || [];
+                if (traces.length === 0) {
+                    list.innerHTML = '<div class="task-item"><div class="task-info" style="color:#607d8b">No traces</div></div>';
+                    return;
+                }
+
+                list.innerHTML = traces.slice(0, 30).map(t => {
+                    const total = t.total_duration_ms || 1;
+                    const qPct = Math.max(2, t.queue_duration_ms / total * 100);
+                    const sPct = Math.max(2, t.schedule_duration_ms / total * 100);
+                    const ePct = Math.max(2, t.execute_duration_ms / total * 100);
+                    const tPct = Math.max(2, t.transfer_duration_ms / total * 100);
+                    return `
+                        <div class="task-item">
+                            <div class="task-info" style="flex:1">
+                                <div class="task-id">${t.trace_id}</div>
+                                <div class="task-meta">
+                                    ${t.task_type} | ${t.source_node} | ${t.span_count} spans | ${formatDuration(t.total_duration_ms)}
+                                </div>
+                                <div class="trace-phases">
+                                    <div class="trace-phase queue" style="flex:${qPct}" title="Queue: ${formatDuration(t.queue_duration_ms)}"></div>
+                                    <div class="trace-phase schedule" style="flex:${sPct}" title="Schedule: ${formatDuration(t.schedule_duration_ms)}"></div>
+                                    <div class="trace-phase execute" style="flex:${ePct}" title="Execute: ${formatDuration(t.execute_duration_ms)}"></div>
+                                    <div class="trace-phase transfer" style="flex:${tPct}" title="Transfer: ${formatDuration(t.transfer_duration_ms)}"></div>
+                                </div>
+                            </div>
+                            <div class="task-status ${t.final_status}">${t.final_status}</div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (e) {
+                console.error('Failed to fetch traces:', e);
+            }
+        }
+
+        function switchTraceTab(btn, type) {
+            document.querySelectorAll('[data-trace-type]').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentTraceType = type;
+            fetchTraces(type);
+        }
+
         async function updateAll() {
             const connected = await fetchStatus();
             if (connected) {
@@ -1591,6 +2129,8 @@ std::string Observatory::GetEmbeddedHtml() {
                 fetchHistory();
                 fetchTasks();
                 fetchWorkers();
+                fetchAlerts();
+                fetchTraces(currentTraceType);
             }
             document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
         }

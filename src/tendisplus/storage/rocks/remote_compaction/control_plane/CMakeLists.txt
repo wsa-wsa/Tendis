@@ -41,7 +41,10 @@ add_library(control_plane_core STATIC
     worker_manager.cc
     task_scheduler.cc
     control_plane.cc
-    bulk_load_coordinator.cc)
+    bulk_load_coordinator.cc
+    alert_manager.cc
+    metrics_collector.cc
+    task_tracer.cc)
 target_link_libraries(control_plane_core
     control_plane_grpc_proto
     ${_REFLECTION}

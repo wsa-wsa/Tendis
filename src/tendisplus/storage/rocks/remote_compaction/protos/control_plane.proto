@@ -77,6 +77,25 @@ service ControlPlaneService {
   rpc GetWorkerDetail(WorkerDetailRequest) returns (WorkerDetailResponse);
 
   // =========================================================================
+  // Observatory Enhanced API - 增强观测接口
+  // =========================================================================
+
+  // 获取告警列表
+  rpc GetAlerts(GetAlertsRequest) returns (GetAlertsResponse);
+
+  // 获取告警规则列表
+  rpc GetAlertRules(GetAlertRulesRequest) returns (GetAlertRulesResponse);
+
+  // 获取任务追踪链路
+  rpc GetTaskTrace(GetTaskTraceRequest) returns (GetTaskTraceResponse);
+
+  // 获取最近追踪列表
+  rpc GetRecentTraces(GetRecentTracesRequest) returns (GetRecentTracesResponse);
+
+  // 获取 Prometheus 格式指标
+  rpc GetPrometheusMetrics(PrometheusMetricsRequest) returns (PrometheusMetricsResponse);
+
+  // =========================================================================
   // Bulk Load API - 批量加载接口
   // =========================================================================
   
@@ -714,4 +733,138 @@ message BulkLoadShardResponse {
   uint64 total_rows_processed = 4;
   uint64 total_bytes_written = 5;
   uint64 execution_time_ms = 6;
+}
+
+// ============================================================================
+// Observatory Enhanced API Messages - 增强观测接口消息
+// ============================================================================
+
+// 告警级别
+enum AlertSeverity {
+  ALERT_INFO = 0;
+  ALERT_WARNING = 1;
+  ALERT_CRITICAL = 2;
+}
+
+// 告警状态
+enum AlertState {
+  ALERT_INACTIVE = 0;
+  ALERT_FIRING = 1;
+  ALERT_RESOLVED = 2;
+}
+
+// 告警事件
+message AlertEventProto {
+  string event_id = 1;
+  string rule_id = 2;
+  string rule_name = 3;
+  AlertSeverity severity = 4;
+  AlertState state = 5;
+  string metric = 6;
+  double current_value = 7;
+  double threshold = 8;
+  string operator_str = 9;
+  int64 timestamp_ms = 10;
+  string message = 11;
+}
+
+// 告警规则
+message AlertRuleProto {
+  string rule_id = 1;
+  string name = 2;
+  string description = 3;
+  string metric = 4;
+  string operator_str = 5;
+  double threshold = 6;
+  AlertSeverity severity = 7;
+  uint32 duration_sec = 8;
+  bool enabled = 9;
+  AlertState state = 10;
+  double last_value = 11;
+}
+
+// 获取告警请求
+message GetAlertsRequest {
+  bool active_only = 1;           // 只返回活跃告警
+  uint32 history_limit = 2;       // 历史记录最大数量
+}
+
+message GetAlertsResponse {
+  repeated AlertEventProto active_alerts = 1;
+  repeated AlertEventProto alert_history = 2;
+  uint32 total_active = 3;
+  uint32 info_count = 4;
+  uint32 warning_count = 5;
+  uint32 critical_count = 6;
+}
+
+// 获取告警规则请求
+message GetAlertRulesRequest {}
+
+message GetAlertRulesResponse {
+  repeated AlertRuleProto rules = 1;
+}
+
+// 追踪 Span
+message TraceSpanProto {
+  string span_id = 1;
+  string trace_id = 2;
+  string parent_span_id = 3;
+  string operation = 4;
+  string component = 5;
+  string worker_id = 6;
+  int64 start_time_ms = 7;
+  int64 end_time_ms = 8;
+  int64 duration_ms = 9;
+  string status = 10;              // "OK" / "Error" / "Timeout"
+  string error_message = 11;
+  map<string, string> tags = 12;
+}
+
+// 任务追踪
+message TaskTraceProto {
+  string trace_id = 1;
+  string task_type = 2;
+  string source_node_id = 3;
+  int64 start_time_ms = 4;
+  int64 end_time_ms = 5;
+  int64 total_duration_ms = 6;
+  bool is_complete = 7;
+  string final_status = 8;
+  repeated TraceSpanProto spans = 9;
+  int64 queue_duration_ms = 10;
+  int64 schedule_duration_ms = 11;
+  int64 execute_duration_ms = 12;
+  int64 transfer_duration_ms = 13;
+}
+
+// 获取任务追踪请求
+message GetTaskTraceRequest {
+  string task_id = 1;
+}
+
+message GetTaskTraceResponse {
+  bool found = 1;
+  TaskTraceProto trace = 2;
+}
+
+// 获取最近追踪请求
+message GetRecentTracesRequest {
+  uint32 limit = 1;
+  bool slow_only = 2;               // 只返回慢查询
+  uint64 slow_threshold_ms = 3;     // 慢查询阈值 (毫秒)
+  bool failed_only = 4;             // 只返回失败的
+}
+
+message GetRecentTracesResponse {
+  repeated TaskTraceProto traces = 1;
+  uint32 total_traces = 2;
+  uint32 active_traces = 3;
+}
+
+// Prometheus 指标请求
+message PrometheusMetricsRequest {}
+
+message PrometheusMetricsResponse {
+  string metrics_text = 1;          // Prometheus 文本格式
 }

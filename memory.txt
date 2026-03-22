@@ -855,3 +855,67 @@ TendisPlus (compaction_service)
 
 ### 下一步
 后续实验评估与性能测试
+
+---
+
+## 2026-03-22 - 观测平面增强：AlertManager + MetricsCollector + TaskTracer + Prometheus
+
+### 问题
+用户要求实现观测平面增强，包括告警引擎、真实百分位统计、分布式追踪、Prometheus 指标端点和前端增强。
+
+### 新增文件（6个）
+
+#### 1. alert_manager.h/cc - 告警规则引擎
+- `AlertSeverity` (Info/Warning/Critical), `AlertState` (Inactive/Firing/Resolved)
+- `AlertMetric` (12种指标: pending_tasks, failed_rate, p99_latency, worker_count, memory/disk 等)
+- `AlertOperator` (5种比较: >, >=, <, <=, ==)
+- `AlertRule`: 阈值规则 + 持续时间触发 + 运行时状态跟踪
+- `AlertEvent`: 告警事件（触发/恢复）
+- `AlertManager`: 周期检查线程, 9条默认规则, MetricsProvider lambda 回调
+- `InitDefaultRules()`: pending_tasks_high/critical, failed_rate_high/critical, p99_latency_high, queue_time_high, no_workers_online, memory_usage_high, disk_usage_critical
+
+#### 2. metrics_collector.h/cc - 滑动窗口指标收集器
+- 真实 P50/P95/P99 延迟计算（基于排序统计，替代原来的 avg*1.5/2.0 近似值）
+- 滑动窗口吞吐量（每分钟/每小时完成/失败数）
+- `RecordExecutionLatency()`, `RecordQueueLatency()`, `RecordTaskCompleted()`, `RecordTaskFailed()`
+- `ComputePercentiles()`: nearest-rank 方法
+
+#### 3. task_tracer.h/cc - 分布式任务追踪
+- TaskID = TraceID, OpenTelemetry 兼容设计
+- Span 层级: task_submit → task_schedule → task_assign → task_execute → task_complete
+- 便捷方法: TraceTaskSubmit, TraceTaskSchedule, TraceTaskAssign, TraceTaskExecute, TraceTaskComplete, TraceSSTTransfer, TraceSSTIngest
+- 查询: GetTrace, GetRecentTraces, GetSlowTraces, GetFailedTraces
+
+### 修改文件（5个）
+
+#### 4. control_plane.proto - 增强观测 API
+- 5 个新 RPC: GetAlerts, GetAlertRules, GetTaskTrace, GetRecentTraces, GetPrometheusMetrics
+- 枚举: AlertSeverity, AlertState
+- ~15 个新消息: AlertEventProto, AlertRuleProto, TraceSpanProto, TaskTraceProto, PrometheusMetricsRequest/Response 等
+
+#### 5. control_plane.h - 组件整合
+- 新增 include: alert_manager.h, metrics_collector.h, task_tracer.h
+- 新增访问器: GetAlertManager(), GetMetricsCollector(), GetTaskTracer()
+- 新增方法: GeneratePrometheusMetrics()
+- 新增成员: alert_manager_, metrics_collector_, task_tracer_
+
+#### 6. control_plane.cc - 核心集成
+- `InitializeComponents()`: 创建 MetricsCollector, TaskTracer, AlertManager
+- `Start()`: AlertManager 启动 + MetricsProvider lambda（聚合 ClusterStatus, TaskStatistics, Worker 资源）
+- `ReportTaskResult()`: 记录执行/排队延迟到 MetricsCollector, 记录完成追踪到 TaskTracer
+- `SubmitCompactionTask()`: 记录 task_submit 和 task_schedule Span 到 TaskTracer
+- `GetMetricsSnapshot` gRPC: 使用 MetricsCollector 真实 P50/P95/P99 替代近似值
+- 5 个新 gRPC 处理器 + FillTaskTraceProto 辅助方法
+- `GeneratePrometheusMetrics()`: 标准 Prometheus 文本格式（25+ 指标: workers, tasks, latency, alerts, traces）
+
+#### 7. observatory.h/cc - 前端增强
+- 6 个新 API 处理器: HandleApiAlerts, HandleApiAlertRules, HandleApiTraces, HandleApiTraceDetail, HandleApiPrometheusMetrics, HandleApiBulkLoadStatus
+- 6 个新 HTTP 路由: /api/alerts, /api/alert-rules, /api/traces, /api/trace/{id}, /api/prometheus/metrics, /api/bulkload/{id}
+- 前端新增: 告警面板（按级别统计 + 活跃告警列表）, 追踪面板（Recent/Slow/Failed 标签页 + 阶段耗时条）
+- CSS: alert-badge, alert-item, trace-phases 样式
+
+#### 8. CMakeLists.txt - 构建配置
+- control_plane_core 添加 alert_manager.cc, metrics_collector.cc, task_tracer.cc
+
+### 下一步
+实验评估与性能测试

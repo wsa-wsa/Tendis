@@ -14,6 +14,9 @@
 #include "task_model.h"
 #include "task_scheduler.h"
 #include "worker_manager.h"
+#include "alert_manager.h"
+#include "metrics_collector.h"
+#include "task_tracer.h"
 
 namespace tendisplus {
 namespace control_plane {
@@ -179,6 +182,20 @@ class ControlPlane {
     return *worker_manager_;
   }
 
+  // 增强观测组件
+  AlertManager& GetAlertManager() {
+    return *alert_manager_;
+  }
+  MetricsCollector& GetMetricsCollector() {
+    return *metrics_collector_;
+  }
+  TaskTracer& GetTaskTracer() {
+    return *task_tracer_;
+  }
+
+  // 生成 Prometheus 格式指标文本
+  std::string GeneratePrometheusMetrics() const;
+
  private:
   void InitializeComponents();
   void StartGrpcServer();
@@ -190,6 +207,11 @@ class ControlPlane {
   // 核心组件
   std::shared_ptr<WorkerManager> worker_manager_;
   std::unique_ptr<TaskScheduler> scheduler_;
+
+  // 增强观测组件
+  std::unique_ptr<AlertManager> alert_manager_;
+  std::unique_ptr<MetricsCollector> metrics_collector_;
+  std::unique_ptr<TaskTracer> task_tracer_;
 
   // Bulk Load 协调器 (前向声明, 在 control_plane.cc 中定义)
   class BulkLoadCoordinatorImpl;

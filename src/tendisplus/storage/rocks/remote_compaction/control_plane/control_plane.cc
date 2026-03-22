@@ -11,6 +11,7 @@
 #include <grpcpp/server_context.h>
 
 #include <iostream>
+#include <sstream>
 
 #include "control_plane.grpc.pb.h"
 
@@ -376,23 +377,21 @@ class ControlPlaneServiceImpl final
     // 吞吐量统计
     response->set_total_completed(stats.total_completed.load());
     response->set_total_failed(stats.total_failed.load());
-    // Note: completed_last_minute 和 failed_last_minute 需要额外的统计支持
-    // 这里先设置为 0，后续可以添加时间窗口统计
-    response->set_completed_last_minute(0);
-    response->set_failed_last_minute(0);
+    // 使用 MetricsCollector 的真实滑动窗口统计
+    auto& mc = control_plane_.GetMetricsCollector();
+    response->set_completed_last_minute(mc.GetCompletedLastMinute());
+    response->set_failed_last_minute(mc.GetFailedLastMinute());
     
     // 延迟统计
     response->set_avg_queue_time_ms(
       static_cast<uint64_t>(stats.GetAvgQueueTimeMs()));
     response->set_avg_execution_time_ms(
       static_cast<uint64_t>(stats.GetAvgExecutionTimeMs()));
-    // Note: p50/p95/p99 需要额外的直方图统计支持
-    response->set_p50_execution_time_ms(
-      static_cast<uint64_t>(stats.GetAvgExecutionTimeMs()));
-    response->set_p95_execution_time_ms(
-      static_cast<uint64_t>(stats.GetAvgExecutionTimeMs() * 1.5));
-    response->set_p99_execution_time_ms(
-      static_cast<uint64_t>(stats.GetAvgExecutionTimeMs() * 2.0));
+    // 使用 MetricsCollector 的真实百分位统计
+    auto exec_latency = mc.GetExecutionLatencyPercentiles();
+    response->set_p50_execution_time_ms(exec_latency.p50_ms);
+    response->set_p95_execution_time_ms(exec_latency.p95_ms);
+    response->set_p99_execution_time_ms(exec_latency.p99_ms);
     
     // 资源使用
     response->set_cluster_cpu_usage(0.0);  // CPU 使用率需要额外采集
@@ -608,7 +607,184 @@ class ControlPlaneServiceImpl final
     return grpc::Status::OK;
   }
 
+  // =========================================================================
+  // Observatory Enhanced API - 增强观测接口
+  // =========================================================================
+
+  grpc::Status GetAlerts(
+    grpc::ServerContext* context,
+    const ::control_plane::GetAlertsRequest* request,
+    ::control_plane::GetAlertsResponse* response) override {
+    auto& am = control_plane_.GetAlertManager();
+
+    // 活跃告警
+    auto active = am.GetActiveAlerts();
+    for (const auto& evt : active) {
+      auto* proto_alert = response->add_active_alerts();
+      proto_alert->set_event_id(evt.event_id);
+      proto_alert->set_rule_id(evt.rule_id);
+      proto_alert->set_rule_name(evt.rule_name);
+      proto_alert->set_severity(
+        static_cast<::control_plane::AlertSeverity>(evt.severity));
+      proto_alert->set_state(
+        static_cast<::control_plane::AlertState>(evt.state));
+      proto_alert->set_metric(AlertMetricToString(evt.metric));
+      proto_alert->set_current_value(evt.current_value);
+      proto_alert->set_threshold(evt.threshold);
+      proto_alert->set_operator_str(AlertOperatorToString(evt.op));
+      proto_alert->set_timestamp_ms(evt.timestamp_ms);
+      proto_alert->set_message(evt.message);
+    }
+
+    // 告警历史
+    if (!request->active_only()) {
+      uint32_t limit = request->history_limit() > 0 ?
+        request->history_limit() : 50;
+      auto history = am.GetAlertHistory(limit);
+      for (const auto& evt : history) {
+        auto* proto_alert = response->add_alert_history();
+        proto_alert->set_event_id(evt.event_id);
+        proto_alert->set_rule_id(evt.rule_id);
+        proto_alert->set_rule_name(evt.rule_name);
+        proto_alert->set_severity(
+          static_cast<::control_plane::AlertSeverity>(evt.severity));
+        proto_alert->set_state(
+          static_cast<::control_plane::AlertState>(evt.state));
+        proto_alert->set_metric(AlertMetricToString(evt.metric));
+        proto_alert->set_current_value(evt.current_value);
+        proto_alert->set_threshold(evt.threshold);
+        proto_alert->set_operator_str(AlertOperatorToString(evt.op));
+        proto_alert->set_timestamp_ms(evt.timestamp_ms);
+        proto_alert->set_message(evt.message);
+      }
+    }
+
+    response->set_total_active(am.GetActiveAlertCount());
+    response->set_info_count(am.GetAlertCountBySeverity(AlertSeverity::kInfo));
+    response->set_warning_count(
+      am.GetAlertCountBySeverity(AlertSeverity::kWarning));
+    response->set_critical_count(
+      am.GetAlertCountBySeverity(AlertSeverity::kCritical));
+
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetAlertRules(
+    grpc::ServerContext* context,
+    const ::control_plane::GetAlertRulesRequest* request,
+    ::control_plane::GetAlertRulesResponse* response) override {
+    auto& am = control_plane_.GetAlertManager();
+    auto rules = am.GetAllRules();
+
+    for (const auto& rule : rules) {
+      auto* proto_rule = response->add_rules();
+      proto_rule->set_rule_id(rule.rule_id);
+      proto_rule->set_name(rule.name);
+      proto_rule->set_description(rule.description);
+      proto_rule->set_metric(AlertMetricToString(rule.metric));
+      proto_rule->set_operator_str(AlertOperatorToString(rule.op));
+      proto_rule->set_threshold(rule.threshold);
+      proto_rule->set_severity(
+        static_cast<::control_plane::AlertSeverity>(rule.severity));
+      proto_rule->set_duration_sec(rule.duration_sec);
+      proto_rule->set_enabled(rule.enabled);
+      proto_rule->set_state(
+        static_cast<::control_plane::AlertState>(rule.state));
+      proto_rule->set_last_value(rule.last_value);
+    }
+
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetTaskTrace(
+    grpc::ServerContext* context,
+    const ::control_plane::GetTaskTraceRequest* request,
+    ::control_plane::GetTaskTraceResponse* response) override {
+    auto& tracer = control_plane_.GetTaskTracer();
+    auto trace = tracer.GetTrace(request->task_id());
+
+    if (!trace) {
+      response->set_found(false);
+      return grpc::Status::OK;
+    }
+
+    response->set_found(true);
+    FillTaskTraceProto(response->mutable_trace(), *trace);
+
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetRecentTraces(
+    grpc::ServerContext* context,
+    const ::control_plane::GetRecentTracesRequest* request,
+    ::control_plane::GetRecentTracesResponse* response) override {
+    auto& tracer = control_plane_.GetTaskTracer();
+    uint32_t limit = request->limit() > 0 ? request->limit() : 50;
+
+    std::vector<std::shared_ptr<TaskTrace>> traces;
+    if (request->slow_only()) {
+      uint64_t threshold = request->slow_threshold_ms() > 0 ?
+        request->slow_threshold_ms() : 10000;
+      traces = tracer.GetSlowTraces(threshold, limit);
+    } else if (request->failed_only()) {
+      traces = tracer.GetFailedTraces(limit);
+    } else {
+      traces = tracer.GetRecentTraces(limit);
+    }
+
+    for (const auto& trace : traces) {
+      FillTaskTraceProto(response->add_traces(), *trace);
+    }
+
+    response->set_total_traces(tracer.GetTraceCount());
+    response->set_active_traces(tracer.GetActiveTraceCount());
+
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetPrometheusMetrics(
+    grpc::ServerContext* context,
+    const ::control_plane::PrometheusMetricsRequest* request,
+    ::control_plane::PrometheusMetricsResponse* response) override {
+    response->set_metrics_text(control_plane_.GeneratePrometheusMetrics());
+    return grpc::Status::OK;
+  }
+
  private:
+  void FillTaskTraceProto(::control_plane::TaskTraceProto* proto,
+                          const TaskTrace& trace) {
+    proto->set_trace_id(trace.trace_id);
+    proto->set_task_type(trace.task_type);
+    proto->set_source_node_id(trace.source_node_id);
+    proto->set_start_time_ms(trace.start_time_ms);
+    proto->set_end_time_ms(trace.end_time_ms);
+    proto->set_total_duration_ms(trace.total_duration_ms);
+    proto->set_is_complete(trace.is_complete);
+    proto->set_final_status(SpanStatusToString(trace.final_status));
+    proto->set_queue_duration_ms(trace.queue_duration_ms);
+    proto->set_schedule_duration_ms(trace.schedule_duration_ms);
+    proto->set_execute_duration_ms(trace.execute_duration_ms);
+    proto->set_transfer_duration_ms(trace.transfer_duration_ms);
+
+    for (const auto& span : trace.spans) {
+      auto* proto_span = proto->add_spans();
+      proto_span->set_span_id(span.span_id);
+      proto_span->set_trace_id(span.trace_id);
+      proto_span->set_parent_span_id(span.parent_span_id);
+      proto_span->set_operation(span.operation);
+      proto_span->set_component(span.component);
+      proto_span->set_worker_id(span.worker_id);
+      proto_span->set_start_time_ms(span.start_time_ms);
+      proto_span->set_end_time_ms(span.end_time_ms);
+      proto_span->set_duration_ms(span.duration_ms);
+      proto_span->set_status(SpanStatusToString(span.status));
+      proto_span->set_error_message(span.error_message);
+      for (const auto& [k, v] : span.tags) {
+        (*proto_span->mutable_tags())[k] = v;
+      }
+    }
+  }
+
   ControlPlane& control_plane_;
 };
 
@@ -678,6 +854,11 @@ void ControlPlane::InitializeComponents() {
 
   // 创建 Bulk Load Coordinator
   bulk_load_coordinator_ = std::make_unique<BulkLoadCoordinatorImpl>(*this);
+
+  // 创建增强观测组件
+  metrics_collector_ = std::make_unique<MetricsCollector>();
+  task_tracer_ = std::make_unique<TaskTracer>();
+  alert_manager_ = std::make_unique<AlertManager>(AlertManagerConfig());
 }
 
 void ControlPlane::Start() {
@@ -694,6 +875,48 @@ void ControlPlane::Start() {
   // 启动 gRPC Server
   StartGrpcServer();
 
+  // 启动 AlertManager (使用 lambda 回调获取指标)
+  if (alert_manager_) {
+    alert_manager_->Start([this]() -> MetricsSnapshot {
+      MetricsSnapshot snap;
+      auto cluster = GetClusterStatus();
+      const auto& stats = GetTaskStatistics();
+      snap.pending_tasks = cluster.pending_tasks;
+      snap.running_tasks = cluster.running_tasks;
+      snap.total_completed = cluster.total_completed;
+      snap.total_failed = cluster.total_failed;
+      snap.online_workers = cluster.online_workers;
+      snap.total_workers = cluster.total_workers;
+      snap.worker_offline_count = cluster.total_workers - cluster.online_workers;
+      snap.avg_queue_time_ms = stats.GetAvgQueueTimeMs();
+      snap.avg_execution_time_ms = stats.GetAvgExecutionTimeMs();
+      snap.task_timeout_count = stats.total_timeout.load();
+      // 失败率
+      uint64_t total = stats.total_completed.load() + stats.total_failed.load();
+      snap.failed_rate = total > 0 ?
+        (static_cast<double>(stats.total_failed.load()) / total * 100.0) : 0.0;
+      // P99 from metrics collector
+      if (metrics_collector_) {
+        auto latency = metrics_collector_->GetExecutionLatencyPercentiles();
+        snap.p99_execution_time_ms = static_cast<double>(latency.p99_ms);
+      }
+      // 集群资源使用率
+      auto workers = GetWorkers();
+      double total_mem = 0, used_mem = 0, total_disk = 0, used_disk = 0;
+      for (const auto& w : workers) {
+        if (w->status == WorkerStatus::kOnline || w->status == WorkerStatus::kBusy) {
+          total_mem += w->resources.total_memory_mb;
+          used_mem += w->resources.used_memory_mb;
+          total_disk += w->resources.total_disk_mb;
+          used_disk += w->resources.used_disk_mb;
+        }
+      }
+      snap.cluster_memory_usage = total_mem > 0 ? used_mem / total_mem : 0.0;
+      snap.cluster_disk_usage = total_disk > 0 ? used_disk / total_disk : 0.0;
+      return snap;
+    });
+  }
+
   std::cout << "[ControlPlane] Control plane started" << std::endl;
 }
 
@@ -704,6 +927,11 @@ void ControlPlane::Stop() {
 
   // 停止 gRPC Server
   StopGrpcServer();
+
+  // 停止 AlertManager
+  if (alert_manager_) {
+    alert_manager_->Stop();
+  }
 
   // 停止 Task Scheduler
   scheduler_->Stop();
@@ -764,7 +992,19 @@ std::string ControlPlane::SubmitCompactionTask(
   task.params.timeout_sec =
     timeout_sec > 0 ? timeout_sec : config_.default_task_timeout_sec;
 
-  return scheduler_->SubmitTask(task);
+  auto task_id = scheduler_->SubmitTask(task);
+
+  // 记录任务提交追踪
+  if (task_tracer_ && !task_id.empty()) {
+    auto span_id = task_tracer_->TraceTaskSubmit(
+      task_id, "Compaction", source_node_id);
+    task_tracer_->FinishSpan(task_id, span_id);
+    // 记录调度 Span
+    auto sched_span = task_tracer_->TraceTaskSchedule(task_id, span_id);
+    task_tracer_->FinishSpan(task_id, sched_span);
+  }
+
+  return task_id;
 }
 
 std::shared_ptr<TaskInfo> ControlPlane::QueryTask(
@@ -811,6 +1051,33 @@ void ControlPlane::ReportTaskResult(const std::string& worker_id,
                                     const std::string& task_id,
                                     const TaskResult& result) {
   scheduler_->OnTaskCompleted(task_id, result);
+
+  // 记录指标到 MetricsCollector
+  if (metrics_collector_) {
+    if (result.execution_time_ms > 0) {
+      metrics_collector_->RecordExecutionLatency(result.execution_time_ms);
+    }
+    if (result.success) {
+      metrics_collector_->RecordTaskCompleted();
+    } else {
+      metrics_collector_->RecordTaskFailed();
+    }
+    // 记录排队延迟
+    auto task = scheduler_->GetTask(task_id);
+    if (task) {
+      auto queue_ms = task->GetQueueTimeMs();
+      if (queue_ms > 0) {
+        metrics_collector_->RecordQueueLatency(
+          static_cast<uint64_t>(queue_ms));
+      }
+    }
+  }
+
+  // 记录追踪
+  if (task_tracer_) {
+    task_tracer_->TraceTaskComplete(task_id, "",
+                                    result.success, result.error_message);
+  }
 }
 
 std::vector<std::shared_ptr<TaskInfo>> ControlPlane::FetchTasks(
@@ -1047,6 +1314,157 @@ void ControlPlane::ReportIngestResult(
       task_id, success, ingested_sst_count,
       ingested_bytes, ingested_rows, error_message);
   }
+}
+
+// =========================================================================
+// Prometheus Metrics Generation
+// =========================================================================
+
+std::string ControlPlane::GeneratePrometheusMetrics() const {
+  std::ostringstream out;
+
+  auto cluster = GetClusterStatus();
+  const auto& stats = GetTaskStatistics();
+
+  // 集群状态
+  out << "# HELP caas_lsm_workers_total Total number of registered workers\n";
+  out << "# TYPE caas_lsm_workers_total gauge\n";
+  out << "caas_lsm_workers_total " << cluster.total_workers << "\n";
+
+  out << "# HELP caas_lsm_workers_online Number of online workers\n";
+  out << "# TYPE caas_lsm_workers_online gauge\n";
+  out << "caas_lsm_workers_online " << cluster.online_workers << "\n";
+
+  out << "# HELP caas_lsm_tasks_pending Number of pending tasks\n";
+  out << "# TYPE caas_lsm_tasks_pending gauge\n";
+  out << "caas_lsm_tasks_pending " << cluster.pending_tasks << "\n";
+
+  out << "# HELP caas_lsm_tasks_running Number of running tasks\n";
+  out << "# TYPE caas_lsm_tasks_running gauge\n";
+  out << "caas_lsm_tasks_running " << cluster.running_tasks << "\n";
+
+  // 任务计数器 (累积)
+  out << "# HELP caas_lsm_tasks_submitted_total Total submitted tasks\n";
+  out << "# TYPE caas_lsm_tasks_submitted_total counter\n";
+  out << "caas_lsm_tasks_submitted_total " << stats.total_submitted.load() << "\n";
+
+  out << "# HELP caas_lsm_tasks_completed_total Total completed tasks\n";
+  out << "# TYPE caas_lsm_tasks_completed_total counter\n";
+  out << "caas_lsm_tasks_completed_total " << stats.total_completed.load() << "\n";
+
+  out << "# HELP caas_lsm_tasks_failed_total Total failed tasks\n";
+  out << "# TYPE caas_lsm_tasks_failed_total counter\n";
+  out << "caas_lsm_tasks_failed_total " << stats.total_failed.load() << "\n";
+
+  out << "# HELP caas_lsm_tasks_cancelled_total Total cancelled tasks\n";
+  out << "# TYPE caas_lsm_tasks_cancelled_total counter\n";
+  out << "caas_lsm_tasks_cancelled_total " << stats.total_cancelled.load() << "\n";
+
+  out << "# HELP caas_lsm_tasks_timeout_total Total timeout tasks\n";
+  out << "# TYPE caas_lsm_tasks_timeout_total counter\n";
+  out << "caas_lsm_tasks_timeout_total " << stats.total_timeout.load() << "\n";
+
+  // 延迟统计
+  out << "# HELP caas_lsm_queue_time_ms Average queue time in milliseconds\n";
+  out << "# TYPE caas_lsm_queue_time_ms gauge\n";
+  out << "caas_lsm_queue_time_ms " << stats.GetAvgQueueTimeMs() << "\n";
+
+  out << "# HELP caas_lsm_execution_time_ms Average execution time in ms\n";
+  out << "# TYPE caas_lsm_execution_time_ms gauge\n";
+  out << "caas_lsm_execution_time_ms " << stats.GetAvgExecutionTimeMs() << "\n";
+
+  // 百分位延迟 (来自 MetricsCollector)
+  if (metrics_collector_) {
+    auto exec_latency = metrics_collector_->GetExecutionLatencyPercentiles();
+    out << "# HELP caas_lsm_execution_latency_p50_ms P50 execution latency\n";
+    out << "# TYPE caas_lsm_execution_latency_p50_ms gauge\n";
+    out << "caas_lsm_execution_latency_p50_ms " << exec_latency.p50_ms << "\n";
+
+    out << "# HELP caas_lsm_execution_latency_p95_ms P95 execution latency\n";
+    out << "# TYPE caas_lsm_execution_latency_p95_ms gauge\n";
+    out << "caas_lsm_execution_latency_p95_ms " << exec_latency.p95_ms << "\n";
+
+    out << "# HELP caas_lsm_execution_latency_p99_ms P99 execution latency\n";
+    out << "# TYPE caas_lsm_execution_latency_p99_ms gauge\n";
+    out << "caas_lsm_execution_latency_p99_ms " << exec_latency.p99_ms << "\n";
+
+    auto queue_latency = metrics_collector_->GetQueueLatencyPercentiles();
+    out << "# HELP caas_lsm_queue_latency_p50_ms P50 queue latency\n";
+    out << "# TYPE caas_lsm_queue_latency_p50_ms gauge\n";
+    out << "caas_lsm_queue_latency_p50_ms " << queue_latency.p50_ms << "\n";
+
+    out << "# HELP caas_lsm_queue_latency_p99_ms P99 queue latency\n";
+    out << "# TYPE caas_lsm_queue_latency_p99_ms gauge\n";
+    out << "caas_lsm_queue_latency_p99_ms " << queue_latency.p99_ms << "\n";
+
+    // 滑动窗口吞吐量
+    out << "# HELP caas_lsm_completed_last_minute Tasks completed in last minute\n";
+    out << "# TYPE caas_lsm_completed_last_minute gauge\n";
+    out << "caas_lsm_completed_last_minute " << metrics_collector_->GetCompletedLastMinute() << "\n";
+
+    out << "# HELP caas_lsm_failed_last_minute Tasks failed in last minute\n";
+    out << "# TYPE caas_lsm_failed_last_minute gauge\n";
+    out << "caas_lsm_failed_last_minute " << metrics_collector_->GetFailedLastMinute() << "\n";
+  }
+
+  // 资源使用率
+  auto workers = GetWorkers();
+  double total_mem = 0, used_mem = 0, total_disk = 0, used_disk = 0;
+  uint32_t busy_count = 0;
+  for (const auto& w : workers) {
+    if (w->status == WorkerStatus::kOnline || w->status == WorkerStatus::kBusy) {
+      total_mem += w->resources.total_memory_mb;
+      used_mem += w->resources.used_memory_mb;
+      total_disk += w->resources.total_disk_mb;
+      used_disk += w->resources.used_disk_mb;
+    }
+    if (w->status == WorkerStatus::kBusy) {
+      busy_count++;
+    }
+  }
+
+  out << "# HELP caas_lsm_workers_busy Number of busy workers\n";
+  out << "# TYPE caas_lsm_workers_busy gauge\n";
+  out << "caas_lsm_workers_busy " << busy_count << "\n";
+
+  out << "# HELP caas_lsm_cluster_memory_usage Cluster memory usage ratio\n";
+  out << "# TYPE caas_lsm_cluster_memory_usage gauge\n";
+  out << "caas_lsm_cluster_memory_usage "
+      << (total_mem > 0 ? used_mem / total_mem : 0.0) << "\n";
+
+  out << "# HELP caas_lsm_cluster_disk_usage Cluster disk usage ratio\n";
+  out << "# TYPE caas_lsm_cluster_disk_usage gauge\n";
+  out << "caas_lsm_cluster_disk_usage "
+      << (total_disk > 0 ? used_disk / total_disk : 0.0) << "\n";
+
+  // 告警统计
+  if (alert_manager_) {
+    out << "# HELP caas_lsm_alerts_active Number of active alerts\n";
+    out << "# TYPE caas_lsm_alerts_active gauge\n";
+    out << "caas_lsm_alerts_active " << alert_manager_->GetActiveAlertCount() << "\n";
+
+    out << "# HELP caas_lsm_alerts_by_severity Active alerts by severity\n";
+    out << "# TYPE caas_lsm_alerts_by_severity gauge\n";
+    out << "caas_lsm_alerts_by_severity{severity=\"info\"} "
+        << alert_manager_->GetAlertCountBySeverity(AlertSeverity::kInfo) << "\n";
+    out << "caas_lsm_alerts_by_severity{severity=\"warning\"} "
+        << alert_manager_->GetAlertCountBySeverity(AlertSeverity::kWarning) << "\n";
+    out << "caas_lsm_alerts_by_severity{severity=\"critical\"} "
+        << alert_manager_->GetAlertCountBySeverity(AlertSeverity::kCritical) << "\n";
+  }
+
+  // 追踪统计
+  if (task_tracer_) {
+    out << "# HELP caas_lsm_traces_total Total trace count\n";
+    out << "# TYPE caas_lsm_traces_total gauge\n";
+    out << "caas_lsm_traces_total " << task_tracer_->GetTraceCount() << "\n";
+
+    out << "# HELP caas_lsm_traces_active Active trace count\n";
+    out << "# TYPE caas_lsm_traces_active gauge\n";
+    out << "caas_lsm_traces_active " << task_tracer_->GetActiveTraceCount() << "\n";
+  }
+
+  return out.str();
 }
 
 }  // namespace control_plane
