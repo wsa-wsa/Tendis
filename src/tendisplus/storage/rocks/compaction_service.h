@@ -15,6 +15,7 @@
 #include "rocksdb/options.h"
 
 #include "tendisplus/storage/rocks/remote_compaction/control_plane_client.h"
+#include "tendisplus/storage/rocks/remote_compaction/bulk_load_ingester.h"
 #include "tendisplus/storage/rocks/remote_compaction/def.h"
 #include "tendisplus/storage/rocks/remote_compaction/worker_manager.h"
 
@@ -178,5 +179,24 @@ class MyTestCompactionService : public CompactionService {
   // Legacy 模式 - Worker Manager for multi-node support
   // =========================================================================
   std::shared_ptr<tendisplus::remote_compaction::WorkerManager> worker_manager_;
+
+  // =========================================================================
+  // CaaS-LSM: Bulk Load 支持
+  // =========================================================================
+ public:
+  // 提交并执行 Bulk Load 任务 (通过 Control Plane)
+  // db: RocksDB 实例指针
+  // data_cf: 数据 CF 句柄
+  // binlog_cf: Binlog CF 句柄
+  // 返回注入结果
+  tendisplus::remote_compaction::BulkLoadIngestResult ExecuteBulkLoad(
+    rocksdb::DB* db,
+    rocksdb::ColumnFamilyHandle* data_cf,
+    rocksdb::ColumnFamilyHandle* binlog_cf,
+    const tendisplus::remote_compaction::BulkLoadSubmitParams& params);
+
+  // 查询 Bulk Load 状态
+  tendisplus::remote_compaction::BulkLoadStatusInfo QueryBulkLoadStatus(
+    const std::string& task_id);
 };
 }  // namespace ROCKSDB_NAMESPACE

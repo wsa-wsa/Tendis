@@ -760,3 +760,98 @@ Control Plane                    CSA Worker
 
 ### 下一步
 继续执行 Commit 3.3: TendisPlus 端 SST 注入（BulkLoadIngester）
+
+---
+
+## 2026-03-22 - Commit 3.3: TendisPlus 端 SST 注入（BulkLoadIngester）
+
+### 问题
+用户要求继续执行 Commit 3.3 的实现，构建 TendisPlus 端的 SST 文件注入引擎。
+
+### 核心设计
+- **BulkLoadIngester**: TendisPlus 端 SST 注入执行器
+- 完整流程：验证 SST → 按 CF 分类 → IngestExternalFile → 上报 Control Plane
+- 通过 RocksKVStore::getBaseDB() 获取 rocksdb::DB*
+- 双 CF 注入：Data CF (default) + Binlog CF
+- 支持共享文件系统（NFS/HDFS）上的 SST 文件
+- ControlPlaneClient 新增 Bulk Load 完整 API
+
+### 新增文件（2个）
+
+#### 1. bulk_load_ingester.h - BulkLoadIngester 类接口
+- `IngestSSTFileInfo`: SST 文件信息（路径/CF/大小/条目数/key范围/校验和）
+- `BulkLoadIngestParams`: 注入参数（task_id, sst_files, shared_fs_uri, 注入选项）
+- `BulkLoadIngestResult`: 注入结果（ingested_sst_count/bytes/rows/time_ms）
+- `BulkLoadIngester::Ingest()`: 主入口，接受 DB*/CF 句柄/参数
+- 私有方法：ValidateSSTFiles, ClassifySSTFilesByCF, BuildIngestOptions, ReportIngestResult
+
+#### 2. bulk_load_ingester.cc - BulkLoadIngester 完整实现
+- `IngesterFSCache`: 匿名命名空间单例，共享文件系统缓存
+- `Ingest()`: 编排验证 → 分类 → IngestExternalFile → 上报
+- `ValidateSSTFiles()`: 检查文件存在性 + SstFileReader 验证有效性
+- `ClassifySSTFilesByCF()`: 按 column_family 分为 data_cf 和 binlog_cf
+- `BuildIngestOptions()`: 构建 IngestExternalFileOptions
+- `ReportIngestResult()`: 通过 gRPC 调用 ReportIngestResult RPC
+
+### 修改文件（6个）
+
+#### 3. control_plane_client.h - 新增 Bulk Load API 结构体和方法
+- `BulkLoadSubmitParams`: Bulk Load 提交参数
+- `BulkLoadStatusInfo`: 状态查询结果（含 SST 文件元数据列表）
+- `SubmitBulkLoadTask()`: 提交 Bulk Load 任务
+- `QueryBulkLoadStatus()`: 查询状态（含 SST 文件列表）
+- `ReportIngestResult()`: 上报注入结果
+- `CancelBulkLoad()`: 取消 Bulk Load
+
+#### 4. control_plane_client.cc - 实现 Bulk Load API
+- 4 个新方法的完整 gRPC 调用实现
+- 所有调用通过 ControlPlaneService Stub
+
+#### 5. compaction_service.h/cc - 集成 Bulk Load 入口
+- `ExecuteBulkLoad()`: 完整的 Bulk Load 编排方法
+  - 提交任务 → 轮询等待 SST 生成 → 本地注入
+  - 支持超时控制、阶段检查、错误处理
+- `QueryBulkLoadStatus()`: 查询 Bulk Load 状态
+
+#### 6. CMakeLists.txt 更新（2个文件）
+- `control_plane/CMakeLists.txt`: 新增 `bulk_load_ingester` 静态库
+- `rocks/CMakeLists.txt`: `rocks_kvstore` 链接 `bulk_load_ingester`
+
+### 完整 Bulk Load 数据流
+```
+TendisPlus (compaction_service)
+  │
+  ├── 1. SubmitBulkLoadTask() ──────► Control Plane
+  │                                     │ BulkLoadCoordinator
+  │                                     │ PlanShards → SubmitShardTasks
+  │                                     ▼
+  │                                   TaskScheduler
+  │                                     │ DistributeBulkLoadShardToCSA
+  │                                     ▼
+  │                                   WorkerManager ──► CSA Worker
+  │                                                      │ BulkLoadExecutor
+  │                                                      │ Read→Sort→GenerateSST
+  │                                                      ▼
+  ├── 2. QueryBulkLoadStatus() ◄──── SST 文件 → 共享存储
+  │      (轮询等待 SST 生成完成)
+  │
+  ├── 3. BulkLoadIngester.Ingest()
+  │      ValidateSSTFiles
+  │      ClassifySSTFilesByCF
+  │      IngestExternalFile(data_cf)
+  │      IngestExternalFile(binlog_cf)
+  │
+  └── 4. ReportIngestResult() ──────► Control Plane
+                                       OnIngestResult → kCompleted
+```
+
+### Git Commit
+`feat(CaaS-LSM): Commit 3.3 - TendisPlus 端 SST 注入引擎 BulkLoadIngester`
+
+### Bulk Load 全链路完成状态
+- ✅ Commit 3.1: 任务模型 + Proto 扩展 + 调度集成
+- ✅ Commit 3.2: Worker 端 SST 生成 (BulkLoadExecutor)
+- ✅ Commit 3.3: TendisPlus 端 SST 注入 (BulkLoadIngester)
+
+### 下一步
+后续实验评估与性能测试

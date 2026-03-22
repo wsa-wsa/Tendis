@@ -912,4 +912,161 @@ std::string MyTestCompactionService::GetCurrentCSAAddress() const {
   return remote_options_.csa_address;
 }
 
+// ============================================================================
+// CaaS-LSM: Bulk Load 支持
+// ============================================================================
+
+tendisplus::remote_compaction::BulkLoadIngestResult
+MyTestCompactionService::ExecuteBulkLoad(
+  rocksdb::DB* db,
+  rocksdb::ColumnFamilyHandle* data_cf,
+  rocksdb::ColumnFamilyHandle* binlog_cf,
+  const tendisplus::remote_compaction::BulkLoadSubmitParams& params) {
+  using namespace tendisplus::remote_compaction;
+
+  BulkLoadIngestResult result;
+
+  if (!use_control_plane_ || !control_plane_client_) {
+    result.error_message = "Bulk Load requires Control Plane mode";
+    std::cerr << "[CompactionService] " << result.error_message << std::endl;
+    return result;
+  }
+
+  std::string source_node_id = remote_options_.csa_address.empty()
+    ? "tendisplus_node" : remote_options_.csa_address;
+
+  // 步骤 1: 提交 Bulk Load 任务到 Control Plane
+  std::cout << "[CompactionService] Submitting Bulk Load task:"
+            << " source=" << params.source_path
+            << ", store=" << params.target_store_id << std::endl;
+
+  auto submit_result = control_plane_client_->SubmitBulkLoadTask(
+    source_node_id, db_path_, params);
+
+  if (!submit_result.success) {
+    result.error_message =
+      "Failed to submit Bulk Load task: " + submit_result.error_message;
+    std::cerr << "[CompactionService] " << result.error_message << std::endl;
+    return result;
+  }
+
+  std::string task_id = submit_result.task_id;
+  std::cout << "[CompactionService] Bulk Load task submitted: " << task_id
+            << std::endl;
+
+  // 步骤 2: 轮询等待所有分片完成 SST 生成
+  // BulkLoadPhase: kCreated=0, kPlanning=1, kSSTGeneration=2,
+  //               kSSTIngestion=3, kVerification=4, kCompleted=5
+  const int kPhaseIngestion = 3;
+  const int kPhaseCompleted = 5;
+  const int kPhaseFailed = 6;
+  const uint32_t poll_interval_ms = 2000;
+  const uint32_t max_wait_ms = params.timeout_sec * 1000;
+
+  auto wait_start = std::chrono::steady_clock::now();
+  BulkLoadStatusInfo status_info;
+
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - wait_start).count();
+    if (static_cast<uint32_t>(elapsed) > max_wait_ms) {
+      result.error_message = "Bulk Load timeout after " +
+        std::to_string(elapsed) + "ms";
+      std::cerr << "[CompactionService] " << result.error_message << std::endl;
+      control_plane_client_->CancelBulkLoad(task_id, "timeout");
+      return result;
+    }
+
+    status_info = control_plane_client_->QueryBulkLoadStatus(task_id);
+
+    if (!status_info.found) {
+      result.error_message = "Bulk Load task lost: " + task_id;
+      std::cerr << "[CompactionService] " << result.error_message << std::endl;
+      return result;
+    }
+
+    // 检查是否已失败
+    if (status_info.overall_status == RemoteTaskStatus::kFailed ||
+        status_info.phase == kPhaseFailed) {
+      result.error_message =
+        "Bulk Load failed: " + status_info.error_message;
+      std::cerr << "[CompactionService] " << result.error_message << std::endl;
+      return result;
+    }
+
+    // 检查是否已到注入阶段或更后 (SST 生成全部完成)
+    if (status_info.phase >= kPhaseIngestion) {
+      std::cout << "[CompactionService] Bulk Load SST generation complete:"
+                << " shards=" << status_info.completed_shards
+                << "/" << status_info.total_shards
+                << ", sst_files=" << status_info.all_sst_files.size()
+                << std::endl;
+      break;
+    }
+
+    // 检查是否已全部完成（已被其他节点注入）
+    if (status_info.phase >= kPhaseCompleted ||
+        status_info.overall_status == RemoteTaskStatus::kCompleted) {
+      result.success = true;
+      result.ingested_sst_count = status_info.all_sst_files.size();
+      std::cout << "[CompactionService] Bulk Load already completed"
+                << std::endl;
+      return result;
+    }
+
+    std::cout << "[CompactionService] Waiting for SST generation:"
+              << " phase=" << status_info.phase
+              << ", progress=" << status_info.progress_percent << "%"
+              << ", shards=" << status_info.completed_shards
+              << "/" << status_info.total_shards << std::endl;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
+  }
+
+  // 步骤 3: SST 生成完成，执行本地注入
+  BulkLoadIngestParams ingest_params;
+  ingest_params.task_id = task_id;
+  ingest_params.source_node_id = source_node_id;
+  ingest_params.target_store_id = params.target_store_id;
+  ingest_params.target_db_path = params.target_db_path;
+  ingest_params.shared_fs_uri = params.shared_fs_uri;
+  ingest_params.verify_checksum = params.verify_checksum;
+  ingest_params.control_plane_address =
+    remote_options_.control_plane_address;
+
+  // 将 Control Plane 返回的 SST 文件信息转换为注入参数
+  for (const auto& sst : status_info.all_sst_files) {
+    IngestSSTFileInfo file_info;
+    file_info.file_path = sst.file_path;
+    file_info.column_family = sst.column_family;
+    file_info.file_size = sst.file_size;
+    file_info.num_entries = sst.num_entries;
+    file_info.smallest_key = sst.smallest_key;
+    file_info.largest_key = sst.largest_key;
+    file_info.checksum = sst.checksum;
+    ingest_params.sst_files.push_back(std::move(file_info));
+  }
+
+  std::cout << "[CompactionService] Starting SST ingestion:"
+            << " sst_files=" << ingest_params.sst_files.size() << std::endl;
+
+  BulkLoadIngester ingester;
+  result = ingester.Ingest(db, data_cf, binlog_cf, ingest_params);
+
+  return result;
+}
+
+tendisplus::remote_compaction::BulkLoadStatusInfo
+MyTestCompactionService::QueryBulkLoadStatus(const std::string& task_id) {
+  using namespace tendisplus::remote_compaction;
+
+  if (!use_control_plane_ || !control_plane_client_) {
+    BulkLoadStatusInfo info;
+    info.error_message = "Bulk Load requires Control Plane mode";
+    return info;
+  }
+
+  return control_plane_client_->QueryBulkLoadStatus(task_id);
+}
+
 }  // namespace ROCKSDB_NAMESPACE

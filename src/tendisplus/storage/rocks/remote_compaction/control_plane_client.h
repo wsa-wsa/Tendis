@@ -69,6 +69,60 @@ struct TaskResultInfo {
 };
 
 // ============================================================================
+// Bulk Load 提交参数
+// ============================================================================
+struct BulkLoadSubmitParams {
+  // 数据源
+  int32_t source_type = 0;          // DataSourceType 枚举值
+  std::string source_path;          // 数据源路径 (共享存储上)
+  int32_t data_format = 0;          // DataFormat 枚举值
+
+  // 目标配置
+  uint32_t target_store_id = 0;
+  std::string target_db_path;
+  std::string shared_fs_uri;
+  std::string sst_output_dir;
+
+  // SST 生成配置
+  int32_t compression = 3;          // CompressionType (默认 LZ4)
+  uint64_t target_sst_size = 64 * 1024 * 1024;  // 64MB
+  bool generate_binlog = false;
+  bool verify_checksum = true;
+  uint32_t timeout_sec = 7200;
+
+  // 资源控制
+  int64_t rate_limit_bytes_per_sec = 0;
+};
+
+// ============================================================================
+// Bulk Load 状态查询结果
+// ============================================================================
+struct BulkLoadStatusInfo {
+  bool found = false;
+  std::string task_id;
+  RemoteTaskStatus overall_status = RemoteTaskStatus::kUnknown;
+  int32_t phase = 0;                // BulkLoadPhase 枚举值
+  uint32_t total_shards = 0;
+  uint32_t completed_shards = 0;
+  uint32_t failed_shards = 0;
+  uint32_t running_shards = 0;
+  double progress_percent = 0.0;
+  std::string error_message;
+
+  // SST 文件元数据 (注入用)
+  struct SSTFileInfo {
+    std::string file_path;
+    std::string column_family;
+    uint64_t file_size = 0;
+    uint64_t num_entries = 0;
+    std::string smallest_key;
+    std::string largest_key;
+    std::string checksum;
+  };
+  std::vector<SSTFileInfo> all_sst_files;
+};
+
+// ============================================================================
 // Control Plane Client - 控制平面客户端
 // ============================================================================
 class ControlPlaneClient {
@@ -116,6 +170,35 @@ class ControlPlaneClient {
   // timeout_ms: 等待超时时间，0 表示立即返回当前状态
   TaskResultInfo WaitForTaskResult(const std::string& task_id,
                                    uint32_t timeout_ms = 0);
+
+  // =========================================================================
+  // Bulk Load API
+  // =========================================================================
+
+  // 提交 Bulk Load 任务
+  SubmitResult SubmitBulkLoadTask(
+    const std::string& source_node_id,
+    const std::string& db_name,
+    const BulkLoadSubmitParams& params,
+    int32_t priority = 1);
+
+  // 查询 Bulk Load 状态 (包含 SST 文件元数据)
+  BulkLoadStatusInfo QueryBulkLoadStatus(const std::string& task_id);
+
+  // 上报 SST 注入结果
+  bool ReportIngestResult(
+    const std::string& task_id,
+    const std::string& source_node_id,
+    bool success,
+    uint32_t ingested_sst_count,
+    uint64_t ingested_bytes,
+    uint64_t ingested_rows,
+    const std::string& error_message,
+    uint64_t ingest_time_ms);
+
+  // 取消 Bulk Load 任务
+  bool CancelBulkLoad(const std::string& task_id,
+                      const std::string& reason = "");
 
   // =========================================================================
   // 监控 API

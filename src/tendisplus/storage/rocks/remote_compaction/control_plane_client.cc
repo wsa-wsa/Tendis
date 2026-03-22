@@ -249,6 +249,223 @@ TaskResultInfo ControlPlaneClient::WaitForTaskResult(const std::string& task_id,
   return result;
 }
 
+// ============================================================================
+// Bulk Load API
+// ============================================================================
+
+SubmitResult ControlPlaneClient::SubmitBulkLoadTask(
+  const std::string& source_node_id,
+  const std::string& db_name,
+  const BulkLoadSubmitParams& params,
+  int32_t priority) {
+  SubmitResult result;
+
+  if (!EnsureConnected()) {
+    result.error_message = "Not connected to control plane";
+    return result;
+  }
+
+  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+
+  control_plane::SubmitBulkLoadRequest request;
+  request.set_source_node_id(source_node_id);
+  request.set_db_name(db_name);
+  request.set_priority(
+    static_cast<control_plane::TaskPriority>(priority));
+
+  // 填充 Bulk Load 参数
+  auto* bl_params = request.mutable_params();
+  bl_params->set_source_type(
+    static_cast<control_plane::DataSourceType>(params.source_type));
+  bl_params->set_source_path(params.source_path);
+  bl_params->set_data_format(
+    static_cast<control_plane::DataFormat>(params.data_format));
+  bl_params->set_target_store_id(params.target_store_id);
+  bl_params->set_target_db_path(params.target_db_path);
+  bl_params->set_shared_fs_uri(params.shared_fs_uri);
+  bl_params->set_sst_output_dir(params.sst_output_dir);
+  bl_params->set_compression(
+    static_cast<control_plane::CompressionType>(params.compression));
+  bl_params->set_target_sst_size(params.target_sst_size);
+  bl_params->set_generate_binlog(params.generate_binlog);
+  bl_params->set_verify_checksum(params.verify_checksum);
+  bl_params->set_timeout_sec(params.timeout_sec);
+  bl_params->set_rate_limit_bytes_per_sec(params.rate_limit_bytes_per_sec);
+
+  control_plane::SubmitBulkLoadResponse response;
+  grpc::ClientContext context;
+
+  auto deadline = std::chrono::system_clock::now() +
+                  std::chrono::milliseconds(config_.request_timeout_ms);
+  context.set_deadline(deadline);
+
+  grpc::Status status =
+    stub->SubmitBulkLoadTask(&context, request, &response);
+
+  if (!status.ok()) {
+    result.error_message = "gRPC error: " + status.error_message();
+    std::cerr << "[ControlPlaneClient] SubmitBulkLoadTask failed: "
+              << result.error_message << std::endl;
+    return result;
+  }
+
+  result.success = response.success();
+  result.task_id = response.task_id();
+  result.error_message = response.error_message();
+
+  if (result.success) {
+    std::cout << "[ControlPlaneClient] Bulk Load task submitted: "
+              << result.task_id << std::endl;
+  }
+
+  return result;
+}
+
+BulkLoadStatusInfo ControlPlaneClient::QueryBulkLoadStatus(
+  const std::string& task_id) {
+  BulkLoadStatusInfo info;
+
+  if (!EnsureConnected()) {
+    info.error_message = "Not connected to control plane";
+    return info;
+  }
+
+  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+
+  control_plane::QueryBulkLoadRequest request;
+  request.set_task_id(task_id);
+
+  control_plane::QueryBulkLoadResponse response;
+  grpc::ClientContext context;
+
+  auto deadline = std::chrono::system_clock::now() +
+                  std::chrono::milliseconds(config_.request_timeout_ms);
+  context.set_deadline(deadline);
+
+  grpc::Status status =
+    stub->QueryBulkLoadStatus(&context, request, &response);
+
+  if (!status.ok()) {
+    info.error_message = "gRPC error: " + status.error_message();
+    return info;
+  }
+
+  info.found = response.found();
+  if (!info.found) {
+    info.error_message = "Bulk Load task not found: " + task_id;
+    return info;
+  }
+
+  info.task_id = response.task_id();
+  info.overall_status =
+    static_cast<RemoteTaskStatus>(response.overall_status());
+  info.phase = static_cast<int32_t>(response.phase());
+  info.total_shards = response.total_shards();
+  info.completed_shards = response.completed_shards();
+  info.failed_shards = response.failed_shards();
+  info.running_shards = response.running_shards();
+  info.progress_percent = response.progress_percent();
+  info.error_message = response.error_message();
+
+  // 提取 SST 文件元数据 (供注入使用)
+  for (const auto& proto_sst : response.all_sst_files()) {
+    BulkLoadStatusInfo::SSTFileInfo sst;
+    sst.file_path = proto_sst.file_path();
+    sst.column_family = proto_sst.column_family();
+    sst.file_size = proto_sst.file_size();
+    sst.num_entries = proto_sst.num_entries();
+    sst.smallest_key = proto_sst.smallest_key();
+    sst.largest_key = proto_sst.largest_key();
+    sst.checksum = proto_sst.checksum();
+    info.all_sst_files.push_back(std::move(sst));
+  }
+
+  return info;
+}
+
+bool ControlPlaneClient::ReportIngestResult(
+  const std::string& task_id,
+  const std::string& source_node_id,
+  bool success,
+  uint32_t ingested_sst_count,
+  uint64_t ingested_bytes,
+  uint64_t ingested_rows,
+  const std::string& error_message,
+  uint64_t ingest_time_ms) {
+  if (!EnsureConnected()) {
+    return false;
+  }
+
+  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+
+  control_plane::ReportIngestResultRequest request;
+  request.set_task_id(task_id);
+  request.set_source_node_id(source_node_id);
+  request.set_success(success);
+  request.set_ingested_sst_count(ingested_sst_count);
+  request.set_ingested_bytes(ingested_bytes);
+  request.set_ingested_rows(ingested_rows);
+  request.set_error_message(error_message);
+  request.set_ingest_time_ms(ingest_time_ms);
+
+  control_plane::ReportIngestResultResponse response;
+  grpc::ClientContext context;
+
+  auto deadline = std::chrono::system_clock::now() +
+                  std::chrono::milliseconds(config_.request_timeout_ms);
+  context.set_deadline(deadline);
+
+  grpc::Status grpc_status =
+    stub->ReportIngestResult(&context, request, &response);
+
+  if (!grpc_status.ok()) {
+    std::cerr << "[ControlPlaneClient] ReportIngestResult failed: "
+              << grpc_status.error_message() << std::endl;
+    return false;
+  }
+
+  std::cout << "[ControlPlaneClient] Ingest result reported: task_id="
+            << task_id << ", success=" << success << std::endl;
+  return response.success();
+}
+
+bool ControlPlaneClient::CancelBulkLoad(const std::string& task_id,
+                                        const std::string& reason) {
+  if (!EnsureConnected()) {
+    return false;
+  }
+
+  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+
+  control_plane::CancelBulkLoadRequest request;
+  request.set_task_id(task_id);
+  request.set_reason(reason);
+
+  control_plane::CancelBulkLoadResponse response;
+  grpc::ClientContext context;
+
+  auto deadline = std::chrono::system_clock::now() +
+                  std::chrono::milliseconds(config_.request_timeout_ms);
+  context.set_deadline(deadline);
+
+  grpc::Status grpc_status =
+    stub->CancelBulkLoad(&context, request, &response);
+
+  if (!grpc_status.ok()) {
+    std::cerr << "[ControlPlaneClient] CancelBulkLoad failed: "
+              << grpc_status.error_message() << std::endl;
+    return false;
+  }
+
+  if (response.success()) {
+    std::cout << "[ControlPlaneClient] Bulk Load cancelled: " << task_id
+              << ", cancelled_shards=" << response.cancelled_shards()
+              << std::endl;
+  }
+
+  return response.success();
+}
+
 ControlPlaneClient::ClusterStatus ControlPlaneClient::GetClusterStatus() {
   ClusterStatus status;
 

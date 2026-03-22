@@ -103,6 +103,19 @@ target_link_libraries(bulk_load_executor
     rocksdb
     shared_fs)
 
+# ============================================================================
+# Bulk Load Ingester - TendisPlus 端 SST 注入引擎
+# ============================================================================
+add_library(bulk_load_ingester STATIC
+    ../bulk_load_ingester.cc)
+target_link_libraries(bulk_load_ingester
+    control_plane_grpc_proto
+    rocksdb
+    shared_fs
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF})
+
 # Control plane worker library (for CSA worker integration)
 add_library(control_plane_worker STATIC
     ../control_plane_worker.cc)

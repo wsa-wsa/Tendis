@@ -138,6 +138,7 @@ add_library(rocks_kvstore STATIC rocks_kvstore.cpp rocks_kvttlcompactfilter.cpp 
 target_link_libraries(rocks_kvstore utils_common kvstore rocksdb record glog ${SYS_LIBS} snappy lz4_static csa_grpc_proto 
             shared_fs
             control_plane_client
+            bulk_load_ingester
             ${_REFLECTION}
             ${_GRPC_GRPCPP}
             ${_PROTOBUF_LIBPROTOBUF}
