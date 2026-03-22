@@ -15,6 +15,7 @@
 #include "rocksdb/env.h"
 
 #include "tendisplus/storage/rocks/shared_filesystem.h"
+#include "bulk_load_executor.h"
 
 namespace tendisplus {
 namespace remote_compaction {
@@ -525,6 +526,108 @@ void ControlPlaneWorker::ReportTaskResult(const std::string& task_id,
 
   if (!status.ok()) {
     std::cerr << "[ControlPlaneWorker] ReportTaskResult failed: "
+              << status.error_message() << std::endl;
+  }
+}
+
+// ============================================================================
+// Bulk Load 分片执行
+// ============================================================================
+BulkLoadShardResult ControlPlaneWorker::ExecuteBulkLoadShard(
+  const BulkLoadShardTaskInfo& task) {
+  BulkLoadShardResult result;
+
+  std::cout << "[ControlPlaneWorker] Executing Bulk Load shard:"
+            << " task_id=" << task.task_id
+            << ", shard_id=" << task.shard_id
+            << ", source=" << task.source_path << std::endl;
+
+  // 构建 BulkLoadExecutor 参数
+  BulkLoadExecuteParams exec_params;
+  exec_params.task_id = task.task_id;
+  exec_params.shard_id = task.shard_id;
+  exec_params.shard_index = task.shard_index;
+  exec_params.source_type = task.source_type;
+  exec_params.source_path = task.source_path;
+  exec_params.data_format = task.data_format;
+  exec_params.key_range_start = task.key_range_start;
+  exec_params.key_range_end = task.key_range_end;
+  exec_params.slot_start = task.slot_start;
+  exec_params.slot_end = task.slot_end;
+  exec_params.shared_fs_uri = task.shared_fs_uri;
+  exec_params.sst_output_dir = task.sst_output_dir;
+  exec_params.compression = task.compression;
+  exec_params.target_sst_size = task.target_sst_size;
+  exec_params.generate_binlog = task.generate_binlog;
+  exec_params.target_store_id = task.target_store_id;
+  exec_params.target_db_path = task.target_db_path;
+  exec_params.rate_limit_bytes_per_sec = task.rate_limit_bytes_per_sec;
+  exec_params.timeout_sec = task.timeout_sec;
+
+  // 执行
+  BulkLoadExecutor executor;
+  auto exec_result = executor.Execute(exec_params);
+
+  // 转换结果
+  result.success = exec_result.success;
+  result.error_message = exec_result.error_message;
+  result.execution_time_ms = exec_result.execution_time_ms;
+  result.total_rows_processed = exec_result.total_rows_processed;
+  result.total_bytes_written = exec_result.total_bytes_written;
+
+  for (const auto& sst : exec_result.sst_files) {
+    BulkLoadShardResult::SSTMeta meta;
+    meta.file_path = sst.file_path;
+    meta.column_family = sst.column_family;
+    meta.file_size = sst.file_size;
+    meta.num_entries = sst.num_entries;
+    result.sst_files.push_back(std::move(meta));
+  }
+  result.sst_files_count = result.sst_files.size();
+
+  return result;
+}
+
+// ============================================================================
+// 上报 Bulk Load 分片结果
+// ============================================================================
+void ControlPlaneWorker::ReportBulkLoadResult(
+  const std::string& task_id,
+  const BulkLoadShardResult& result) {
+  if (!channel_) {
+    return;
+  }
+
+  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+
+  // 复用 TaskResultRequest 上报，通过 SST 文件信息区分 Bulk Load 结果
+  control_plane::TaskResultRequest request;
+  request.set_worker_id(worker_id_);
+  request.set_task_id(task_id);
+  request.set_success(result.success);
+  request.set_error_message(result.error_message);
+  request.set_execution_time_ms(result.execution_time_ms);
+  request.set_bytes_written(result.total_bytes_written);
+  request.set_bytes_read(0);
+
+  // compaction_result 字段复用为 Bulk Load 的 SST 文件统计信息
+  std::ostringstream oss;
+  oss << "bulk_load_result:rows=" << result.total_rows_processed
+      << ",sst_count=" << result.sst_files_count;
+  for (const auto& sst : result.sst_files) {
+    oss << "|" << sst.file_path << ":" << sst.file_size;
+  }
+  request.set_compaction_result(oss.str());
+
+  control_plane::TaskResultResponse response;
+  grpc::ClientContext context;
+  auto deadline =
+    std::chrono::system_clock::now() + std::chrono::seconds(10);
+  context.set_deadline(deadline);
+
+  grpc::Status status = stub->ReportTaskResult(&context, request, &response);
+  if (!status.ok()) {
+    std::cerr << "[ControlPlaneWorker] ReportBulkLoadResult failed: "
               << status.error_message() << std::endl;
   }
 }

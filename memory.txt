@@ -1,0 +1,762 @@
+# Tendis Remote Compaction 开发记录
+
+## 2026-02-02 - 重构：Observatory 独立部署
+
+### 需求
+用户要求将 Observatory 从 Control Plane Server 中分离出来，作为独立进程部署。
+
+### 重构前架构
+```
+control_plane_server (单进程)
+    ├── ControlPlane (gRPC: 50051)
+    └── Observatory (HTTP: 8080) ← 内嵌
+```
+
+### 重构后架构
+```
+┌─────────────────┐        ┌─────────────────────────────────────┐
+│   Observatory   │  gRPC  │         Control Plane               │
+│  (独立进程)      │◄──────►│         (独立进程)                   │
+│                 │        │                                     │
+│  HTTP: 8080     │        │  gRPC: 50051                        │
+│  - Web UI       │        │  - Task Management                  │
+│  - REST API     │        │  - Worker Management                │
+└─────────────────┘        └─────────────────────────────────────┘
+         │
+         ▼
+    Web Browser
+```
+
+### 修改的文件
+
+#### 1. observatory.h - 完全重写
+- 移除对 `ControlPlane*` 的直接依赖
+- 添加 gRPC 客户端配置 (`control_plane_address`, `grpc_timeout_ms`, `reconnect_interval_sec`)
+- 添加连接管理 (`ConnectLoop()`, `TryConnect()`, `IsConnected()`)
+- 添加连接状态 API (`HandleApiConnectionStatus()`)
+
+#### 2. observatory.cc - 完全重写
+- 实现 gRPC 客户端自动连接/重连
+- 所有数据获取通过 gRPC stub 调用 Control Plane
+- 前端 HTML 添加连接状态指示器和断连提示
+
+#### 3. observatory_server.cc - 新增
+- 独立的 Observatory 服务器入口
+- 命令行参数：
+  - `-c <address>`: Control Plane 地址 (默认: localhost:50051)
+  - `-p <port>`: HTTP 端口 (默认: 8080)
+  - `-b <address>`: HTTP 绑定地址 (默认: 0.0.0.0)
+  - `-t <ms>`: gRPC 超时 (默认: 5000ms)
+  - `-r <sec>`: 重连间隔 (默认: 5s)
+
+#### 4. control_plane_server.cc - 简化
+- 移除 Observatory 相关代码
+- 移除 `-w` 参数
+
+#### 5. control_plane.cc - 添加 Observatory gRPC API 实现
+- `ListTasks()` - 获取任务列表
+- `GetMetricsSnapshot()` - 获取实时指标快照
+- `GetWorkerDetail()` - 获取 Worker 详情
+
+#### 6. CMakeLists.txt - 重新组织
+```cmake
+# Control Plane 核心库 (不含 observatory)
+add_library(control_plane_core STATIC ...)
+
+# Control Plane Server
+add_executable(control_plane_server ...)
+
+# Observatory 库 (独立 gRPC 客户端)
+add_library(observatory STATIC observatory.cc)
+
+# Observatory Server (独立部署)
+add_executable(observatory_server observatory_server.cc)
+```
+
+### 使用方式
+
+```bash
+# 1. 启动 Control Plane Server
+./control_plane_server -l 0.0.0.0:50051
+
+# 2. 启动 Observatory Server (可以在另一台机器)
+./observatory_server -c localhost:50051 -p 8080
+
+# 3. 访问监控界面
+open http://localhost:8080
+```
+
+### 优势
+1. **独立扩展** - Observatory 可以独立部署多个实例
+2. **灵活部署** - 可以部署在不同机器上
+3. **故障隔离** - Observatory 故障不影响 Control Plane
+4. **多监控** - 一个 Observatory 可以监控多个 Control Plane（未来扩展）
+
+### 前端变化
+- 添加连接状态指示器 (Connected/Disconnected)
+- 断连时显示重连提示遮罩
+- API 响应包含 `connected` 字段
+
+---
+
+## 2026-02-02 - Q&A：Observatory 是否独立存在？
+
+**问题**：这个观测平面是独立存在的吗？
+
+**答案**：**不是独立存在的**，Observatory 是内嵌在 Control Plane Server 中的组件。
+
+**架构关系**：
+```
+control_plane_server (进程)
+    ├── ControlPlane (gRPC 服务, 端口 50051)
+    │   ├── WorkerManager
+    │   ├── TaskScheduler
+    │   └── gRPC Service
+    └── Observatory (HTTP 服务, 端口 8080) ← 内嵌组件
+        ├── 实时指标采集线程
+        ├── HTTP 服务器
+        └── 内嵌前端 HTML/JS
+```
+
+**关键设计**：
+- `Observatory` 持有 `ControlPlane*` 指针（不拥有所有权）
+- 直接调用 ControlPlane 的方法获取数据
+- 随 control_plane_server 一起启动/停止
+
+**启动命令**：
+```bash
+./control_plane_server -l 0.0.0.0:50051 -w 8080
+# gRPC: 50051, HTTP: 8080
+```
+
+**如果需要独立部署**，需要重构为通过 gRPC 客户端连接 Control Plane。
+
+---
+
+## 2026-02-02 - 新增：Observatory 可视化观测平面
+
+### 功能描述
+为 Control Plane 添加实时监控可视化界面，用于监控 Remote Compaction 运行状态。
+
+### 实现的功能
+
+#### 1. 实时指标监控
+- **集群状态**: Workers 在线数、任务队列长度
+- **吞吐量**: 完成/失败任务数、每分钟处理速率
+- **延迟分布**: P50/P95/P99 延迟、平均队列时间、平均执行时间
+- **资源使用**: 内存使用率、磁盘使用率
+
+#### 2. 可视化图表
+- **吞吐量趋势图**: 显示任务完成/失败的时序变化
+- **任务队列图**: Pending/Running 任务数量变化
+- **延迟趋势图**: 队列延迟和执行延迟的历史趋势
+- **资源使用图**: 内存使用率随时间变化
+
+#### 3. 任务列表
+- 支持按状态过滤 (All/Running/Pending/Failed)
+- 显示任务ID、来源节点、Worker分配、运行时长
+- 实时更新任务状态
+
+#### 4. Worker 列表
+- 显示 Worker 状态 (Online/Offline/Busy)
+- 显示资源使用情况 (任务数/内存/磁盘)
+- 负载进度条可视化
+
+### 新增文件
+
+1. **observatory.h** - 观测平面头文件
+```cpp
+struct MetricsDataPoint;        // 历史数据点
+struct ObservatoryConfig;       // 配置
+class Observatory;              // HTTP 服务器 + 指标采集
+```
+
+2. **observatory.cc** - 观测平面实现
+- HTTP 服务器 (使用 POSIX socket，无额外依赖)
+- REST API 端点:
+  - `GET /api/metrics` - 实时指标
+  - `GET /api/metrics/history` - 历史数据 (300 点)
+  - `GET /api/workers` - Worker 列表
+  - `GET /api/workers/{id}` - Worker 详情
+  - `GET /api/tasks` - 任务列表
+  - `GET /api/task/{id}` - 任务详情
+  - `GET /api/cluster` - 集群状态
+- 内嵌 HTML/JS 前端 (单文件，使用 Chart.js)
+- 指标采集线程 (每 2 秒采集)
+
+### 修改的文件
+
+1. **control_plane_server.cc** - 启动 Observatory
+```cpp
+#include "observatory.h"
+
+// 添加 -w 参数指定 HTTP 端口
+ObservatoryConfig obs_config;
+obs_config.http_port = 8080;
+
+// 启动 Observatory
+g_observatory = std::make_unique<Observatory>(obs_config, g_control_plane.get());
+g_observatory->Start();
+```
+
+2. **control_plane/CMakeLists.txt** - 添加 observatory.cc 到 control_plane_core
+
+3. **control_plane.proto** - 扩展观测 API
+```protobuf
+// Observatory API
+rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+rpc GetMetricsSnapshot(MetricsSnapshotRequest) returns (MetricsSnapshotResponse);
+rpc GetWorkerDetail(WorkerDetailRequest) returns (WorkerDetailResponse);
+```
+
+### 使用方式
+
+```bash
+# 启动 Control Plane Server (默认 gRPC:50051, HTTP:8080)
+./control_plane_server
+
+# 自定义端口
+./control_plane_server -l 0.0.0.0:9000 -w 9080
+
+# 访问监控界面
+open http://localhost:8080
+```
+
+### 界面预览
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  🔭 Remote Compaction Observatory                          │
+│  ● CaaS-LSM Real-time Monitoring Dashboard                 │
+├────────────────────────────────────────────────────────────┤
+│  [3 Online] [12 Pending] [5 Running] [1.2K Completed] [15 Failed]
+├────────────────────────────────────────────────────────────┤
+│  ┌──────────────────┐  ┌──────────────────┐               │
+│  │ Throughput Chart │  │ Task Queue Chart │               │
+│  └──────────────────┘  └──────────────────┘               │
+│  ┌──────────────────┐  ┌──────────────────┐               │
+│  │ P50:12ms P95:45ms│  │ Resource Usage   │               │
+│  │ P99:120ms        │  │ Memory: 65%      │               │
+│  └──────────────────┘  └──────────────────┘               │
+├────────────────────────────────────────────────────────────┤
+│  Active Tasks                 │  Workers                  │
+│  [All] [Running] [Pending]    │  ├ worker-1 ● Online 3/5  │
+│  ├ task-001 Running 12s       │  ├ worker-2 ● Busy   5/5  │
+│  ├ task-002 Pending           │  └ worker-3 ○ Offline     │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 数据来源 (基于现有系统)
+所有数据均来自现有 Control Plane 组件：
+- `ControlPlane::GetClusterStatus()` - 集群状态
+- `ControlPlane::GetTaskStatistics()` - 任务统计
+- `ControlPlane::GetWorkers()` - Worker 列表
+- `TaskScheduler::QueryTasks()` - 任务查询
+- `TaskScheduler::GetTask()` - 任务详情
+
+---
+
+## 2026-02-02 - 修复链接错误：control_plane_client 未链接
+
+### 问题描述
+编译时出现链接错误：
+```
+undefined reference to `tendisplus::remote_compaction::ControlPlaneClient::~ControlPlaneClient()'
+undefined reference to `tendisplus::remote_compaction::ControlPlaneClient::IsConnected() const'
+undefined reference to `tendisplus::remote_compaction::ControlPlaneClient::SubmitCompactionTask(...)'
+undefined reference to `tendisplus::remote_compaction::ControlPlaneClient::WaitForTaskResult(...)'
+undefined reference to `tendisplus::remote_compaction::ControlPlaneClient::Connect()'
+undefined reference to `tendisplus::remote_compaction::ControlPlaneClient::GetClusterStatus()'
+undefined reference to `tendisplus::remote_compaction::ControlPlaneClient::ControlPlaneClient(...)'
+```
+
+### 问题根源
+`compaction_service.cc` 使用了 `ControlPlaneClient` 类，但是 `rocks_kvstore` 库没有链接 `control_plane_client` 静态库。
+
+`control_plane_client` 库是在 `remote_compaction/control_plane/CMakeLists.txt` 中定义的。
+
+### 解决方案
+修改 `src/tendisplus/storage/rocks/CMakeLists.txt`：
+
+1. **调整 add_subdirectory 位置** - 移动到 `rocks_kvstore` 定义之前
+2. **添加 control_plane_client 链接** - 在 `rocks_kvstore` 的 target_link_libraries 中添加
+
+**修改前**：
+```cmake
+add_library(rocks_kvstore STATIC ...)
+target_link_libraries(rocks_kvstore ... shared_fs ...)
+
+# add_subdirectory 在后面，太晚了
+add_subdirectory(remote_compaction/control_plane)
+```
+
+**修改后**：
+```cmake
+# add_subdirectory 移到前面，先定义 control_plane_client
+add_subdirectory(remote_compaction/control_plane)
+
+add_library(rocks_kvstore STATIC ...)
+target_link_libraries(rocks_kvstore ... shared_fs control_plane_client ...)
+```
+
+### 库依赖关系
+```
+rocks_kvstore
+    ├── shared_fs → nfs_fs
+    ├── control_plane_client → control_plane_grpc_proto
+    └── csa_grpc_proto
+```
+
+---
+
+## 2026-02-02 - 重构：实现 CaaS-LSM 架构（Tendisplus → Control Plane → CSA Workers）
+
+### 问题描述
+原设计中 `compaction_service.cc` 直接连接 CSA Server（通过 `csa_address` 配置），
+不符合 CaaS-LSM 架构的设计理念：
+- 正确架构：Tendisplus → Control Plane → Multiple CSA Workers
+- 错误实现：Tendisplus → CSA Workers（直连）
+
+### 解决方案
+重构代码支持两种模式：
+1. **Control Plane 模式**（推荐）：通过 `ControlPlaneClient` 提交任务到控制平面
+2. **Legacy 模式**（兼容）：直连 CSA Server（用于单节点测试）
+
+### 修改的文件
+
+1. **server_params.h** - 添加 `controlPlaneAddress` 配置
+```cpp
+std::string controlPlaneAddress = "";  // Control Plane address (host:port)
+```
+
+2. **server_params.cpp** - 注册配置参数
+```cpp
+REGISTER_VARS_DIFF_NAME("control_plane_address", controlPlaneAddress);
+```
+
+3. **def.h** - 添加 `control_plane_address` 到 `RemoteOpenAndCompactOptions`
+```cpp
+std::string control_plane_address;  // CaaS-LSM: Control Plane address
+std::string csa_address;            // Legacy: Direct CSA address
+```
+
+4. **compaction_service.h** - 重构接口
+   - 添加 `use_control_plane_` 标志
+   - 添加 `control_plane_client_` 成员
+   - 添加 `InitControlPlaneClient()` 方法
+   - 添加 `WaitForCompleteViaControlPlane()` 方法
+   - 添加 `WaitForCompleteViaDirectCSA()` 方法
+   - 添加 `IsUsingControlPlane()` 方法
+
+5. **compaction_service.cc** - 核心重构
+   - `InitRemoteCompaction()` 根据配置选择模式
+   - `InitControlPlaneClient()` 初始化控制平面客户端
+   - `WaitForCompleteV2()` 分发到对应模式
+   - `WaitForCompleteViaControlPlane()` 通过控制平面提交任务
+   - `WaitForCompleteViaDirectCSA()` 保留原有直连逻辑
+
+6. **rocks_kvstore.cpp** - 传递配置
+   - 优先读取 `controlPlaneAddress`
+   - 回退到 `csaAddress`
+
+7. **tendisplus_rc.conf** - 配置示例
+   - `control_plane_address` 替代 `csa_address`
+   - 添加架构说明
+
+### 架构图
+```
+┌─────────────┐      ┌─────────────────┐      ┌─────────────┐
+│ Tendisplus  │─────▶│  Control Plane  │─────▶│ CSA Worker1 │
+│   Node 1    │      │   (Scheduler)   │      ├─────────────┤
+├─────────────┤      │                 │─────▶│ CSA Worker2 │
+│ Tendisplus  │─────▶│ - Task Queue    │      ├─────────────┤
+│   Node 2    │      │ - Load Balance  │─────▶│ CSA Worker3 │
+└─────────────┘      │ - Worker Mgmt   │      └─────────────┘
+                     └─────────────────┘
+                            ▲
+                            │ Shared Storage (NFS/HDFS/S3)
+                            ▼
+```
+
+### 工作流程
+1. Tendisplus 启动时检查 `control_plane_address`
+2. 如果配置了控制平面：
+   - 创建 `ControlPlaneClient`
+   - 连接控制平面
+   - 通过 `SubmitCompactionTask()` 提交任务
+   - 通过 `WaitForTaskResult()` 等待结果
+3. 如果未配置控制平面，回退到 Legacy 模式（直连 CSA）
+
+### 配置示例
+```conf
+# CaaS-LSM 架构（推荐）
+control_plane_address localhost:9010
+remote_compaction.shared_fs_uri nfs://localhost/shared/rocksdb
+
+# Legacy 模式（单节点测试）
+# csa_address localhost:8010
+```
+
+---
+
+## 2026-02-01 - 修复链接错误：重构共享文件系统接口设计
+
+### 问题描述
+编译时出现链接错误：
+```
+undefined reference to `rocksdb::NFSFileSystem::Create`
+undefined reference to `rocksdb::NewNFSFileSystem`
+undefined reference to `rocksdb::CreateSharedFileSystem`
+undefined reference to `rocksdb::RegisterSharedFileSystemPathPrefix`
+```
+
+### 问题根源
+`rocks_kvstore.cpp` 直接调用了 NFS 具体实现（`NFSFileSystem::Create`、`NewNFSFileSystem`），
+而不是使用统一的共享文件系统接口 `CreateSharedFileSystem`。
+
+这违反了接口抽象原则：上层代码不应该依赖具体实现。
+
+### 解决方案
+重构设计，让 `rocks_kvstore.cpp` 只使用统一接口：
+
+**修改前**（错误的设计）:
+```cpp
+// rocks_kvstore.cpp 直接判断协议类型，调用具体实现
+if (shared_fs_uri.find("nfs://") == 0) {
+    rocksdb::NFSFileSystem::Create(...);  // 直接依赖NFS实现
+    rocksdb::NewNFSFileSystem(...);       // 直接依赖NFS实现
+} else {
+    rocksdb::CreateSharedFileSystem(...); // 只有非NFS才用统一接口
+}
+```
+
+**修改后**（正确的设计）:
+```cpp
+// rocks_kvstore.cpp 只使用统一接口
+rocksdb::CreateSharedFileSystem(base, uri, local_prefix, &result);
+// CreateSharedFileSystem 内部处理不同协议
+```
+
+### 修改的文件
+
+1. **shared_filesystem.h** - 更新接口签名，添加 `local_prefix` 参数
+2. **shared_filesystem.cc** - 实现内部根据 URI 协议调用具体实现（NFS支持URI模式和路径匹配模式）
+3. **rocks_kvstore.cpp** - 移除对 `nfs_filesystem.h` 的依赖，只使用统一接口
+
+### CMakeLists.txt 库结构调整
+
+用户要求将 shared_filesystem 单独设置为静态库：
+
+**修改后的库依赖结构**:
+```
+rocks_kvstore
+    ↓ 链接
+shared_fs (新增独立静态库，包含 shared_filesystem.cc)
+    ↓ 链接
+nfs_fs (NFS 具体实现：nfs_filesystem.cc + nfs_file.cc)
+```
+
+**CMakeLists.txt 修改**:
+```cmake
+# NFS 具体实现库
+add_library(nfs_fs STATIC nfs_filesystem.cc nfs_file.cc)
+
+# 共享文件系统接口层（独立静态库）
+add_library(shared_fs STATIC shared_filesystem.cc)
+target_link_libraries(shared_fs PUBLIC nfs_fs rocksdb)
+
+# rocks_kvstore 链接 shared_fs
+target_link_libraries(rocks_kvstore ... shared_fs ...)
+```
+
+### 设计原则
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    rocks_kvstore.cpp                        │
+│                         (上层)                              │
+│                           │                                 │
+│                           ▼                                 │
+│              CreateSharedFileSystem()                       │
+│                    (统一接口)                                │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      shared_fs 库                           │
+│                  shared_filesystem.cc                       │
+│                      (接口层)                                │
+│                           │                                 │
+│         ┌─────────────────┼─────────────────┐              │
+│         ▼                 ▼                 ▼              │
+│   nfs://             hdfs://            s3://              │
+│   NFSFileSystem      HdfsFileSystem     S3FileSystem       │
+│     (具体实现)          (具体实现)         (具体实现)          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 职责分离
+- `rocks_kvstore` - 只知道统一接口 `CreateSharedFileSystem`
+- `shared_fs` - 接口层，负责路由到具体实现
+- `nfs_fs` - NFS 具体实现
+
+---
+
+## 2026-03-22 - 全面审视：开题报告 vs 已实现代码完成度评估
+
+### 问题
+用户要求对照上级目录的开题报告，全面审视项目完成情况，并制定分次提交计划。
+
+### 审视结论
+
+**整体进度约 55%**
+
+| 模块 | 完成度 | 状态 |
+|------|--------|------|
+| ① 统一任务模型与状态机 | 90% | ✅ 基本完成 |
+| ② 远程 Compaction 执行机制 | 85% | ✅ 核心完成 |
+| ③ 远程 Bulk Load 与 SST Ingest | 5% | ❌ 未开始（仅枚举定义） |
+| ④ 统一任务调度与资源感知 | 75% | ⚠️ 需完善 |
+| ⑤ 控制平面与观测平面 | 85% | ✅ 核心完成 |
+| ⑥ 实验评估与性能测试 | 0% | ❌ 未开始 |
+
+### 主要已完成项
+- 完整的 CaaS-LSM 三层架构（Tendisplus → Control Plane → CSA Workers）
+- 双模式支持（Control Plane 模式 + Legacy 直连模式）
+- 12个 gRPC API 的 Control Plane Server
+- 4种调度策略（FIFO/Priority/FairShare/LeastLoaded）
+- 独立部署的 Observatory 可视化监控平台
+- NFS/HDFS 共享文件系统支持
+- 约26个源文件，300KB+ 代码
+
+### 主要待完成项
+1. **Bulk Load 全链路**（最大缺口，开题报告核心承诺）
+2. 现有代码中多处 TODO 需补全（control_plane_worker 共享FS、推送模式 gRPC）
+3. 多维度加权资源评分算法
+4. 业务时间窗口控制
+5. 告警机制与日志追踪
+6. 实验评估与性能测试
+
+### 分次提交计划（7次）
+1. 补全 TODO 和完善已有代码
+2. 资源感知调度算法增强
+3. Bulk Load 任务模型与参数定义
+4. Bulk Load 远程 SST 生成与执行
+5. Bulk Load SST Ingest 与结果接入
+
+---
+
+## 2026-03-22 - Bulk Load 可行性评估与设计文档
+
+### 问题
+用户要求参考 TendisPlus 现有存储层和迁移机制，评估远程 Bulk Load 的可行性，并给出设计文档和论文标题呼应性分析。
+
+### 关键发现
+
+#### TendisPlus 现有 Bulk Load 能力：完全空白
+- TendisPlus 代码中**未使用** `SstFileWriter`、`IngestExternalFile` 等 RocksDB Bulk Load API
+- 现有数据迁移（Migrate）使用**逐条 KV 事务写入**，效率低下
+- RocksDB 层完整 Bulk Load API 可用（SstFileWriter + IngestExternalFile）
+- `RocksKVStore::getBaseDB()` 暴露底层 `rocksdb::DB*`，可直接调用注入 API
+- `getDataColumnFamilyHandle()` 可获取目标 CF 句柄
+
+#### 可行性结论：✅ 高度可行
+- RocksDB 底层 API 完整可用
+- 共享文件系统基础设施（NFS/HDFS）已建好可复用
+- Control Plane 架构可扩展
+- TaskType::kBulkLoad 已预留
+
+#### 核心设计方案
+采用共享文件系统方案（方案A）：
+1. TendisPlus 提交 Bulk Load 任务到 Control Plane
+2. Control Plane 分片规划并派发到 Workers
+3. Workers 读取数据源 → 排序 → SstFileWriter 生成 SST → 写入共享存储
+4. TendisPlus 从共享存储读取 SST → IngestExternalFile 注入
+
+#### 论文标题呼应性：❗ Bulk Load 是必要组成部分
+- 论文标题"远程后台任务"是复数概念，只有 Compaction 一种无法证明"统一"价值
+- 开题报告 4 类实验场景中有 2 类依赖 Bulk Load
+- **仅 Compaction 对标题匹配度约 60%，加上 Bulk Load 可达 90%+**
+
+#### 设计文档位置
+`/Users/wsa/Desktop/paper/Tendis/docs/remote_bulk_load_design.md`
+
+#### 实现计划（3 次提交）
+- 提交 3.1: Bulk Load 任务模型 + Proto 扩展 + 调度集成
+- 提交 3.2: Worker 端 SST 生成（BulkLoadExecutor）
+- 提交 3.3: TendisPlus 端 SST 注入（BulkLoadIngester）
+6. 观测平面增强（告警与追踪）
+7. 实验评估与性能测试
+
+---
+
+## 2026-03-22 - Commit 1: 补全已有 TODO
+
+### 问题
+用户要求按照分次提交计划，从 Commit 1 开始实现。Commit 1 的目标是补全所有已有 TODO 和代码空洞。
+
+### 修改的文件
+
+#### 1. control_plane_worker.cc - 补全共享文件系统环境设置
+- 新增 `SharedFileSystemCache` 单例类（复用 csa_server.cc 的设计模式）
+- 在 `ExecuteCompaction()` 中根据 `shared_fs_uri` 创建共享 FS Env
+- 设置 `options_override.env` 使 `DB::OpenAndCompact()` 能通过共享存储读写 SST
+- 缓存策略：以 URI 为键，双重检查锁避免重复创建
+- 添加了 `<mutex>`, `<unordered_map>`, `rocksdb/env.h`, `shared_filesystem.h` 头文件
+
+#### 2. task_model.h - 添加 kRetrying 状态
+- `TaskStatus` 枚举新增 `kRetrying = 8`（对应开题报告 4.3.4 状态机要求）
+- `TaskStatusToString()` 新增 `"Retrying"` 映射
+- `CanRetry()` 扩展条件包含 `kRetrying`
+- 新增 `IsRetrying()` 辅助方法
+- `kRetrying` 不是终态（`IsTerminal()` 不包含）
+
+#### 3. task_scheduler.cc - 补全推送模式 + 重试逻辑
+- `HandleRetry()`: 重写，先标记 `kRetrying`，从运行队列移除，再转 `kPending` 入队
+- `DistributeTaskToCSA()`: 替换 TODO，调用 `worker_manager_->DistributeJobToCSA()`，
+  成功后更新任务状态为 `kRunning`
+
+#### 4. worker_manager.cc - 补全两处 gRPC 调用
+- `DistributeJobToCSA()`: 创建 `CSAService::Stub`，构建 `DistributeJobRequest`，
+  调用 `DistributeCompactionJob` RPC，30 秒超时
+- `CancelCSATask()`: 创建 `CSAService::Stub`，构建 `CancelRunningTaskRequest`，
+  调用 `CancelRunningTask` RPC，10 秒超时
+- 新增 `control_plane.grpc.pb.h` 头文件
+
+#### 5. control_plane.proto - 协议扩展
+- `TaskStatus` 枚举新增 `TASK_RETRYING = 8`
+
+### 设计文档位置
+`/Users/wsa/Desktop/paper/Tendis/docs/commit1_complete_todos_design.md`
+
+### 下一步
+继续执行 Commit 3.1: Bulk Load 任务模型 + Proto 扩展 + 调度集成
+
+---
+
+## 2026-03-22 - Commit 3.1: Bulk Load 任务模型 + Proto 扩展 + 调度集成
+
+### 问题
+用户要求继续执行 Commit 3.1 的实现。
+
+### 修改的文件（11个文件，+1400/-5）
+
+#### 1. task_model.h - Bulk Load 完整类型体系
+- 新增 6 个枚举 + 5 个结构体，扩展 TaskInfo/TaskResult/TaskFilter
+
+#### 2. task_model.cc - TaskFilter 增加 task_type 过滤
+
+#### 3. control_plane.proto - 完整 Bulk Load Proto 定义
+- 5 个新枚举 + 10 个新消息 + 5 个新 RPC
+
+#### 4. task_scheduler.h/cc - 双队列调度架构
+- Compaction 优先级队列 + Bulk Load FIFO 队列
+- SubmitBulkLoadTask/Shard, DistributeBulkLoadShardToCSA
+
+#### 5. control_plane.h/cc - Bulk Load API + gRPC 处理器
+- 4 个新 RPC 处理器 + 4 个 API 方法
+- BulkLoadCoordinatorImpl (PlanShards, SubmitShardTasks, OnIngestResult)
+
+#### 6. bulk_load_coordinator.h/cc - 新增
+- BulkLoadCoordinator 接口 + BulkLoadTaskSummary
+
+#### 7. CMakeLists.txt - 添加 bulk_load_coordinator.cc
+
+### 设计文档
+`/Users/wsa/Desktop/paper/Tendis/docs/commit3_1_bulk_load_task_model_design.md`
+
+### Git Commit
+`bf13eb1b feat(CaaS-LSM): Commit 3.1 - Bulk Load 任务模型 + Proto 扩展 + 调度集成`
+
+### 下一步
+继续执行 Commit 3.2: Worker 端 SST 生成（BulkLoadExecutor）
+
+---
+
+## 2026-03-22 - Commit 3.2: Worker 端 SST 生成（BulkLoadExecutor）
+
+### 问题
+用户要求继续执行 Commit 3.2 的实现，构建 Worker 端的 SST 文件生成引擎。
+
+### 核心设计
+- **BulkLoadExecutor**: Worker 端的 SST 文件生成执行器
+- 完整流程：ReadDataSource → SortKeyValuePairs → GenerateSSTFiles
+- 参考 SQLEngine/TDStore 的 TDBulkLoadExternalSSTBuilder 模式（简化版）
+- 支持 KV 文件和 SST 文件两种数据源
+- 自动切分 SST 文件（target_sst_size 阈值）
+- 去重 REPLACE 语义（保留最后出现的 value）
+
+### 新增文件（2个）
+
+#### 1. bulk_load_executor.h - BulkLoadExecutor 类接口
+- `BulkLoadExecuteParams`: 执行参数（task_id, shard_id, source_type, source_path, key_range, sst_output_dir, compression, target_sst_size 等）
+- `SSTFileMeta`: SST 文件元数据（file_path, column_family, file_size, num_entries, smallest_key, largest_key, checksum）
+- `BulkLoadExecuteResult`: 执行结果（success, sst_files, total_rows_processed, total_bytes_read/written, execution_time_ms）
+- `BulkLoadExecutor::Execute()`: 主入口
+- 私有方法：ReadDataSource, SortKeyValuePairs, GenerateSSTFiles, GetRocksDBCompression, BuildSSTFilePath, ReadFromKVFile, ReadFromSSTFile
+
+#### 2. bulk_load_executor.cc - BulkLoadExecutor 完整实现
+- `BulkLoadFSCache`: 匿名命名空间单例，共享文件系统缓存
+- `Execute()`: 编排 Read → Sort → Generate SST 流程
+- `ReadDataSource()`: 根据 source_type 分发到 ReadFromKVFile/ReadFromSSTFile
+- `SortKeyValuePairs()`: bytewise 排序 + 去重（REPLACE 语义）
+- `GenerateSSTFiles()`: 使用 SstFileWriter，自动切分，确保同 key 不跨 SST
+- `ReadFromKVFile()`: 支持二进制格式（4B key_len + key + 4B value_len + value）和文本格式（key\tvalue\n）
+- `ReadFromSSTFile()`: 使用 SstFileReader + iterator
+- `BuildSSTFilePath()`: 生成 `{output_dir}/{shard_id}_{cf_name}_{file_index}.external.sst`
+
+### 修改文件（6个）
+
+#### 3. csa_server.cc - CSA 服务端添加 Bulk Load 处理
+- 新增 `CSAServiceImpl` 类实现 `control_plane::CSAService::Service`
+- `ExecuteBulkLoadShard()`: 接收 BulkLoadShardRequest，调用 BulkLoadExecutor::Execute()，返回 SST 元数据
+- `DistributeCompactionJob()`: 桩（Legacy CSA 不支持推送模式）
+- `CheckCSAStatus()`: 返回本地任务数和健康状态
+- `CancelRunningTask()`: TODO 桩
+- `main()` 注册双 gRPC 服务: CSAImpl + CSAServiceImpl
+
+#### 4. control_plane_worker.h/cc - Worker 添加 Bulk Load 能力
+- 新增 `BulkLoadShardTaskInfo` 结构体
+- 新增 `BulkLoadShardResult` 结构体（含 SSTMeta 内嵌结构）
+- `ExecuteBulkLoadShard()`: 构建 BulkLoadExecuteParams，调用 BulkLoadExecutor
+- `ReportBulkLoadResult()`: 复用 TaskResultRequest，编码 SST 元数据到 compaction_result 字段
+
+#### 5. worker_manager.h/cc - WorkerManager 添加 Bulk Load 分发
+- 新增 `DistributeBulkLoadShardToCSA()` 方法
+- 构建 `BulkLoadShardRequest` proto，调用 `CSAService::ExecuteBulkLoadShard` RPC
+- 60 秒超时（Bulk Load 比 Compaction 更耗时）
+- 完整错误处理和日志
+
+#### 6. task_scheduler.cc - 替换 TODO 桩
+- `DistributeBulkLoadShardToCSA()` 从 TODO 桩替换为实际实现
+- 从 TaskInfo 的 bulk_load_params 提取分片参数
+- 调用 `worker_manager_->DistributeBulkLoadShardToCSA()` 推送到 CSA
+
+#### 7. CMakeLists.txt 更新（2个文件）
+- `control_plane/CMakeLists.txt`: 新增 `bulk_load_executor` 静态库，control_plane_worker 链接它
+- `rocks/CMakeLists.txt`: csa_server 链接 `bulk_load_executor` 和 `control_plane_grpc_proto`
+
+### 架构示意
+```
+Control Plane                    CSA Worker
+┌─────────────────┐              ┌─────────────────────────┐
+│ TaskScheduler   │              │  CSAServiceImpl         │
+│  │              │   gRPC       │   │                     │
+│  ▼              │  ─────────►  │   ▼                     │
+│ DistributeBulk  │  ExecuteBulk │  BulkLoadExecutor       │
+│ LoadShardToCSA  │  LoadShard   │   │ ReadDataSource      │
+│  │              │              │   │ SortKeyValuePairs   │
+│  ▼              │              │   │ GenerateSSTFiles    │
+│ WorkerManager   │              │   ▼                     │
+│  │              │              │  SST 文件 → 共享存储    │
+│  ▼              │              └─────────────────────────┘
+│ gRPC Stub ──────┘
+└─────────────────┘
+```
+
+### SQLEngine 对比审计
+- 审查了 SQLEngine/TDStore 的 41 个 Bulk Load 相关文件（700KB+ 代码）
+- TendisPlus 设计与 SQLEngine 架构一致（SST 生成 → 共享存储 → Ingest）
+- 合理简化：无 2PC、无 Raft 日志注入、无外部归并排序
+
+### 下一步
+继续执行 Commit 3.3: TendisPlus 端 SST 注入（BulkLoadIngester）

@@ -115,12 +115,14 @@ foreach(_target csa_server)
     target_link_libraries(${_target}
             #          compaction_service_helper
             csa_grpc_proto
+            control_plane_grpc_proto
             ${_REFLECTION}
             ${_GRPC_GRPCPP}
             ${_PROTOBUF_LIBPROTOBUF}
             rocksdb
             lz4_static
             shared_fs
+            bulk_load_executor
             )
 endforeach()
 

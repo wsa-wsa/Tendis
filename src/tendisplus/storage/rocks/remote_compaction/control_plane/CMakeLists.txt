@@ -94,12 +94,23 @@ target_link_libraries(control_plane_client
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF})
 
+# ============================================================================
+# Bulk Load Executor - Worker 端 SST 生成引擎
+# ============================================================================
+add_library(bulk_load_executor STATIC
+    ../bulk_load_executor.cc)
+target_link_libraries(bulk_load_executor
+    rocksdb
+    shared_fs)
+
 # Control plane worker library (for CSA worker integration)
 add_library(control_plane_worker STATIC
     ../control_plane_worker.cc)
 target_link_libraries(control_plane_worker
     control_plane_grpc_proto
+    bulk_load_executor
     rocksdb
+    shared_fs
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF})

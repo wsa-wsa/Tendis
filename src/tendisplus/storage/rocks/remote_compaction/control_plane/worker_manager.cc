@@ -555,6 +555,124 @@ bool WorkerManager::DistributeJobToCSA(const std::string& worker_id,
   return true;
 }
 
+bool WorkerManager::DistributeBulkLoadShardToCSA(
+  const std::string& worker_id,
+  const std::string& task_id,
+  const std::string& shard_id,
+  uint32_t shard_index,
+  int32_t source_type,
+  const std::string& source_path,
+  int32_t data_format,
+  const std::string& key_range_start,
+  const std::string& key_range_end,
+  uint32_t slot_start,
+  uint32_t slot_end,
+  const std::string& shared_fs_uri,
+  const std::string& sst_output_dir,
+  int32_t compression,
+  uint64_t target_sst_size,
+  bool generate_binlog,
+  uint32_t target_store_id,
+  const std::string& target_db_path,
+  int64_t rate_limit_bytes_per_sec,
+  uint32_t timeout_sec) {
+  auto worker = GetWorker(worker_id);
+  if (!worker) {
+    std::cerr << "[WorkerManager] BulkLoad: Worker not found: " << worker_id
+              << std::endl;
+    return false;
+  }
+
+  if (worker->status != WorkerStatus::kOnline) {
+    std::cerr << "[WorkerManager] BulkLoad: Worker not online: " << worker_id
+              << std::endl;
+    return false;
+  }
+
+  auto channel = GetOrCreateCSAChannel(worker->address);
+  if (!channel) {
+    std::cerr << "[WorkerManager] BulkLoad: Failed to create channel to CSA: "
+              << worker->address << std::endl;
+    return false;
+  }
+
+  // 创建 CSAService::Stub 并调用 ExecuteBulkLoadShard RPC
+  auto stub = control_plane::CSAService::NewStub(channel);
+  if (!stub) {
+    std::cerr << "[WorkerManager] BulkLoad: Failed to create stub for: "
+              << worker->address << std::endl;
+    return false;
+  }
+
+  // 构建 BulkLoadShardRequest
+  control_plane::BulkLoadShardRequest request;
+  request.set_task_id(task_id);
+  request.set_shard_id(shard_id);
+  request.set_shard_index(shard_index);
+  request.set_source_type(
+    static_cast<control_plane::DataSourceType>(source_type));
+  request.set_source_path(source_path);
+  request.set_data_format(
+    static_cast<control_plane::DataFormat>(data_format));
+
+  // Key 范围
+  auto* key_range = request.mutable_key_range();
+  key_range->set_start_key(key_range_start);
+  key_range->set_end_key(key_range_end);
+  key_range->set_slot_start(slot_start);
+  key_range->set_slot_end(slot_end);
+
+  // SST 配置
+  request.set_shared_fs_uri(shared_fs_uri);
+  request.set_sst_output_dir(sst_output_dir);
+  request.set_compression(
+    static_cast<control_plane::CompressionType>(compression));
+  request.set_target_sst_size(target_sst_size);
+  request.set_generate_binlog(generate_binlog);
+  request.set_target_store_id(target_store_id);
+  request.set_target_db_path(target_db_path);
+
+  // 资源控制
+  request.set_rate_limit_bytes_per_sec(rate_limit_bytes_per_sec);
+  request.set_timeout_sec(timeout_sec);
+
+  // 设置 gRPC 超时 (Bulk Load 比 Compaction 可能更耗时)
+  grpc::ClientContext context;
+  auto deadline =
+    std::chrono::system_clock::now() + std::chrono::seconds(60);
+  context.set_deadline(deadline);
+
+  // 调用 RPC
+  control_plane::BulkLoadShardResponse response;
+  grpc::Status grpc_status =
+    stub->ExecuteBulkLoadShard(&context, request, &response);
+
+  if (!grpc_status.ok()) {
+    std::cerr << "[WorkerManager] ExecuteBulkLoadShard RPC failed: "
+              << grpc_status.error_message()
+              << " (worker=" << worker_id << ", task=" << task_id << ")"
+              << std::endl;
+    return false;
+  }
+
+  if (!response.accepted()) {
+    std::cerr << "[WorkerManager] CSA rejected Bulk Load shard: "
+              << shard_id << ", reason: " << response.error_message()
+              << std::endl;
+    return false;
+  }
+
+  std::cout << "[WorkerManager] DistributeBulkLoadShardToCSA success:"
+            << " task=" << task_id
+            << ", shard=" << shard_id
+            << ", worker=" << worker_id
+            << ", rows=" << response.total_rows_processed()
+            << ", sst_files=" << response.generated_sst_files_size()
+            << ", time_ms=" << response.execution_time_ms() << std::endl;
+
+  return true;
+}
+
 bool WorkerManager::CancelCSATask(const std::string& worker_id,
                                   const std::string& task_id) {
   auto worker = GetWorker(worker_id);

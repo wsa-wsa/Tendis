@@ -76,6 +76,60 @@ struct TaskExecutionResult {
 };
 
 // ============================================================================
+// Bulk Load 分片任务信息
+// ============================================================================
+struct BulkLoadShardTaskInfo {
+  std::string task_id;
+  std::string shard_id;
+  uint32_t shard_index = 0;
+
+  // 数据源
+  int32_t source_type = 0;
+  std::string source_path;
+  int32_t data_format = 0;
+
+  // Key 范围
+  std::string key_range_start;
+  std::string key_range_end;
+  uint32_t slot_start = 0;
+  uint32_t slot_end = 0;
+
+  // SST 配置
+  std::string shared_fs_uri;
+  std::string sst_output_dir;
+  int32_t compression = 3;
+  uint64_t target_sst_size = 64 * 1024 * 1024;
+  bool generate_binlog = false;
+  uint32_t target_store_id = 0;
+  std::string target_db_path;
+
+  // 资源控制
+  int64_t rate_limit_bytes_per_sec = 0;
+  uint32_t timeout_sec = 7200;
+};
+
+// ============================================================================
+// Bulk Load 执行结果
+// ============================================================================
+struct BulkLoadShardResult {
+  bool success = false;
+  std::string error_message;
+  uint64_t execution_time_ms = 0;
+  uint64_t total_rows_processed = 0;
+  uint64_t total_bytes_written = 0;
+  uint32_t sst_files_count = 0;
+
+  // SST 文件元数据 (简化: 路径列表)
+  struct SSTMeta {
+    std::string file_path;
+    std::string column_family;
+    uint64_t file_size = 0;
+    uint64_t num_entries = 0;
+  };
+  std::vector<SSTMeta> sst_files;
+};
+
+// ============================================================================
 // Control Plane Worker - CSA Worker 与控制平面集成
 // ============================================================================
 class ControlPlaneWorker {
@@ -117,9 +171,16 @@ class ControlPlaneWorker {
   // 执行 Compaction 任务
   TaskExecutionResult ExecuteCompaction(const CompactionTaskInfo& task);
 
+  // 执行 Bulk Load 分片任务
+  BulkLoadShardResult ExecuteBulkLoadShard(const BulkLoadShardTaskInfo& task);
+
   // 上报任务结果
   void ReportTaskResult(const std::string& task_id,
                         const TaskExecutionResult& result);
+
+  // 上报 Bulk Load 分片结果
+  void ReportBulkLoadResult(const std::string& task_id,
+                            const BulkLoadShardResult& result);
 
   // 标记任务开始执行
   void MarkTaskRunning(const std::string& task_id);

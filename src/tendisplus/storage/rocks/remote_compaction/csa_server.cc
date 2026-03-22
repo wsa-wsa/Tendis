@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "csa.grpc.pb.h"  // NOLINT(build/include_subdir)
+#include "control_plane.grpc.pb.h"
 #include "rocksdb/db.h"
 #include "rocksdb/db/compaction/compaction_job.h"
 #include "rocksdb/db/dbformat.h"
@@ -32,6 +33,7 @@
 #include "util/string_util.h"
 
 #include "tendisplus/storage/rocks/shared_filesystem.h"
+#include "bulk_load_executor.h"
 #ifdef HDFS
 #include "plugin/hdfs/env_hdfs.h"
 #endif
@@ -421,6 +423,138 @@ class CSAImpl final : public csa::CSAService::Service {
   }
 };
 
+// ============================================================================
+// CSA Bulk Load Service - 支持 Bulk Load 分片执行
+// 实现 control_plane.proto 中定义的 CSAService
+// ============================================================================
+class CSAServiceImpl final : public ::control_plane::CSAService::Service {
+ public:
+  // 执行 Bulk Load 分片（SST 生成）
+  grpc::Status ExecuteBulkLoadShard(
+    grpc::ServerContext* context,
+    const ::control_plane::BulkLoadShardRequest* request,
+    ::control_plane::BulkLoadShardResponse* response) override {
+
+    int64_t max_tasks = GetMaxConcurrentTasks();
+    int64_t current = local_task_nums_.fetch_add(1);
+
+    if (current >= max_tasks) {
+      local_task_nums_.fetch_sub(1);
+      std::cout << "[CSA-BulkLoad] Server busy, rejecting Bulk Load shard "
+                << "(current: " << current << ", max: " << max_tasks << ")"
+                << std::endl;
+      response->set_accepted(false);
+      response->set_error_message("CSA server busy");
+      return grpc::Status::OK;
+    }
+
+    std::cout << "[CSA-BulkLoad] Executing Bulk Load shard:"
+              << " task_id=" << request->task_id()
+              << ", shard_id=" << request->shard_id()
+              << ", source=" << request->source_path()
+              << ", output=" << request->sst_output_dir() << std::endl;
+
+    // 构建执行参数
+    tendisplus::remote_compaction::BulkLoadExecuteParams params;
+    params.task_id = request->task_id();
+    params.shard_id = request->shard_id();
+    params.shard_index = request->shard_index();
+    params.source_type = static_cast<int32_t>(request->source_type());
+    params.source_path = request->source_path();
+    params.data_format = static_cast<int32_t>(request->data_format());
+    params.shared_fs_uri = request->shared_fs_uri();
+    params.sst_output_dir = request->sst_output_dir();
+    params.compression = static_cast<int32_t>(request->compression());
+    params.target_sst_size = request->target_sst_size();
+    params.generate_binlog = request->generate_binlog();
+    params.target_store_id = request->target_store_id();
+    params.target_db_path = request->target_db_path();
+    params.rate_limit_bytes_per_sec = request->rate_limit_bytes_per_sec();
+    params.timeout_sec = request->timeout_sec();
+
+    // Key 范围
+    if (request->has_key_range()) {
+      params.key_range_start = request->key_range().start_key();
+      params.key_range_end = request->key_range().end_key();
+      params.slot_start = request->key_range().slot_start();
+      params.slot_end = request->key_range().slot_end();
+    }
+
+    // 执行 Bulk Load
+    tendisplus::remote_compaction::BulkLoadExecutor executor;
+    auto result = executor.Execute(params);
+
+    local_task_nums_.fetch_sub(1);
+
+    // 填充响应
+    response->set_accepted(result.success);
+    if (!result.success) {
+      response->set_error_message(result.error_message);
+      std::cerr << "[CSA-BulkLoad] Shard execution failed: "
+                << result.error_message << std::endl;
+      return grpc::Status::OK;
+    }
+
+    // 上报 SST 文件元数据
+    for (const auto& sst : result.sst_files) {
+      auto* proto_sst = response->add_generated_sst_files();
+      proto_sst->set_file_path(sst.file_path);
+      proto_sst->set_column_family(sst.column_family);
+      proto_sst->set_file_size(sst.file_size);
+      proto_sst->set_num_entries(sst.num_entries);
+      proto_sst->set_smallest_key(sst.smallest_key);
+      proto_sst->set_largest_key(sst.largest_key);
+      proto_sst->set_checksum(sst.checksum);
+    }
+
+    response->set_total_rows_processed(result.total_rows_processed);
+    response->set_total_bytes_written(result.total_bytes_written);
+    response->set_execution_time_ms(result.execution_time_ms);
+
+    std::cout << "[CSA-BulkLoad] Shard completed:"
+              << " task_id=" << request->task_id()
+              << ", shard_id=" << request->shard_id()
+              << ", rows=" << result.total_rows_processed
+              << ", sst_files=" << result.sst_files.size()
+              << ", time_ms=" << result.execution_time_ms << std::endl;
+
+    return grpc::Status::OK;
+  }
+
+  // 分发 Compaction 任务 (CaaS-LSM 推送模式)
+  grpc::Status DistributeCompactionJob(
+    grpc::ServerContext* context,
+    const ::control_plane::DistributeJobRequest* request,
+    ::control_plane::DistributeJobResponse* response) override {
+    // TODO: 转发到 CSAImpl 执行 compaction
+    // 当前 CSA server 保持 Legacy 模式，该 RPC 在新版 Worker 中实现
+    response->set_accepted(false);
+    response->set_error_message("Legacy CSA server does not support push mode");
+    return grpc::Status::OK;
+  }
+
+  // 检查 CSA 状态
+  grpc::Status CheckCSAStatus(
+    grpc::ServerContext* context,
+    const ::control_plane::CSAStatusRequest* request,
+    ::control_plane::CSAStatusResponse* response) override {
+    response->set_local_task_nums(local_task_nums_.load());
+    response->set_is_healthy(true);
+    return grpc::Status::OK;
+  }
+
+  // 取消正在执行的任务
+  grpc::Status CancelRunningTask(
+    grpc::ServerContext* context,
+    const ::control_plane::CancelRunningTaskRequest* request,
+    ::control_plane::CancelRunningTaskResponse* response) override {
+    // TODO: 实现任务取消
+    response->set_success(false);
+    response->set_error_message("Task cancellation not yet implemented");
+    return grpc::Status::OK;
+  }
+};
+
 // Parse command line arguments
 void ParseCommandLine(int argc, char* argv[]) {
   for (int i = 1; i < argc; i++) {
@@ -510,6 +644,7 @@ int main(int argc, char* argv[]) {
   }
 
   CSAImpl service;
+  CSAServiceImpl bulk_load_service;
 
   // Get max gRPC message size from configuration (with default)
   int64_t max_msg_size = compaction_service_options.GetGrpcMaxMessageSize();
@@ -517,6 +652,7 @@ int main(int argc, char* argv[]) {
   grpc::ServerBuilder builder;
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
   builder.RegisterService(&service);
+  builder.RegisterService(&bulk_load_service);
 
   // Set max message size for receiving and sending
   builder.SetMaxReceiveMessageSize(static_cast<int>(max_msg_size));

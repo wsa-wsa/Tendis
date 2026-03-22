@@ -888,8 +888,68 @@ bool TaskScheduler::DistributeBulkLoadShardToCSA(
     return false;
   }
 
-  // TODO(Commit 3.2): 实际通过 gRPC 调用 CSA 的 ExecuteBulkLoadShard RPC
-  // 当前框架阶段只更新状态，实际 gRPC 调用在 Commit 3.2 实现
+  // 通过 gRPC 调用 CSA 的 ExecuteBulkLoadShard RPC (推送模式)
+  // 从 TaskInfo 的 bulk_load_params 中提取分片参数
+  const auto& bl_params = shard_task->bulk_load_params;
+
+  // 找到当前分片信息 (通过 shard_task 的 task_id 匹配)
+  // shard_task 是子任务, 分片信息存储在 bulk_load_params 的第一个 shard 中
+  // 或者通过 task_id 后缀推断
+  std::string shard_id;
+  uint32_t shard_index = 0;
+  std::string source_path = bl_params.source_path;
+  std::string key_range_start;
+  std::string key_range_end;
+  uint32_t slot_start = 0;
+  uint32_t slot_end = 0;
+
+  // 查找匹配的分片信息
+  for (const auto& shard : bl_params.shards) {
+    if (shard_task->task_id.find(shard.shard_id) != std::string::npos) {
+      shard_id = shard.shard_id;
+      shard_index = shard.shard_index;
+      source_path = shard.source_path.empty() ? bl_params.source_path
+                                               : shard.source_path;
+      key_range_start = shard.key_range.start_key;
+      key_range_end = shard.key_range.end_key;
+      slot_start = shard.key_range.slot_start;
+      slot_end = shard.key_range.slot_end;
+      break;
+    }
+  }
+
+  if (shard_id.empty()) {
+    shard_id = shard_task->task_id;
+  }
+
+  bool success = worker_manager_->DistributeBulkLoadShardToCSA(
+    worker_id,
+    shard_task->task_id,
+    shard_id,
+    shard_index,
+    static_cast<int32_t>(bl_params.source_type),
+    source_path,
+    static_cast<int32_t>(bl_params.data_format),
+    key_range_start,
+    key_range_end,
+    slot_start,
+    slot_end,
+    bl_params.shared_fs_uri,
+    bl_params.sst_output_dir,
+    static_cast<int32_t>(bl_params.compression),
+    bl_params.target_sst_size,
+    bl_params.generate_binlog,
+    bl_params.target_store_id,
+    bl_params.target_db_path,
+    bl_params.rate_limit_bytes_per_sec,
+    bl_params.timeout_sec);
+
+  if (!success) {
+    std::cerr << "[TaskScheduler] Failed to distribute Bulk Load shard to CSA: "
+              << shard_task->task_id << " -> " << worker_id << std::endl;
+    return false;
+  }
+
   std::cout << "[TaskScheduler] Bulk Load shard distributed to CSA: "
             << shard_task->task_id << " -> " << worker_id << std::endl;
 

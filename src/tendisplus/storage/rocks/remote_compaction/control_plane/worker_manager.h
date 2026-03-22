@@ -255,6 +255,30 @@ class WorkerManager {
                           int32_t start_level,
                           double score);
 
+  // 分发 Bulk Load 分片到 CSA (推送模式)
+  // 通过 CSAService::ExecuteBulkLoadShard RPC 推送分片任务
+  bool DistributeBulkLoadShardToCSA(
+    const std::string& worker_id,
+    const std::string& task_id,
+    const std::string& shard_id,
+    uint32_t shard_index,
+    int32_t source_type,
+    const std::string& source_path,
+    int32_t data_format,
+    const std::string& key_range_start,
+    const std::string& key_range_end,
+    uint32_t slot_start,
+    uint32_t slot_end,
+    const std::string& shared_fs_uri,
+    const std::string& sst_output_dir,
+    int32_t compression,
+    uint64_t target_sst_size,
+    bool generate_binlog,
+    uint32_t target_store_id,
+    const std::string& target_db_path,
+    int64_t rate_limit_bytes_per_sec,
+    uint32_t timeout_sec);
+
   // 取消 CSA 上正在执行的任务
   bool CancelCSATask(const std::string& worker_id, const std::string& task_id);
 
