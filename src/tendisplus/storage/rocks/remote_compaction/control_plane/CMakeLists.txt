@@ -130,3 +130,43 @@ target_link_libraries(control_plane_worker
     ${_REFLECTION}
     ${_GRPC_GRPCPP}
     ${_PROTOBUF_LIBPROTOBUF})
+
+# ============================================================================
+# Unit Tests
+# ============================================================================
+if(TENDIS_WITH_UNIT_TESTS)
+
+# Layer 1: Pure unit tests (no external dependencies)
+add_executable(task_model_test task_model_test.cpp)
+target_link_libraries(task_model_test control_plane_core gtest_main ${SYS_LIBS})
+
+add_executable(metrics_collector_test metrics_collector_test.cpp)
+target_link_libraries(metrics_collector_test control_plane_core gtest_main ${SYS_LIBS})
+
+add_executable(task_tracer_test task_tracer_test.cpp)
+target_link_libraries(task_tracer_test control_plane_core gtest_main ${SYS_LIBS})
+
+# Layer 2: Mock-based unit tests
+add_executable(alert_manager_test alert_manager_test.cpp)
+target_link_libraries(alert_manager_test control_plane_core gtest_main ${SYS_LIBS})
+
+add_executable(worker_manager_test worker_manager_test.cpp)
+target_link_libraries(worker_manager_test control_plane_core gtest_main ${SYS_LIBS})
+
+add_executable(task_scheduler_test task_scheduler_test.cpp)
+target_link_libraries(task_scheduler_test control_plane_core gtest_main ${SYS_LIBS})
+
+# Layer 3: Integration test
+add_executable(control_plane_test control_plane_test.cpp)
+target_link_libraries(control_plane_test control_plane_core gtest_main ${SYS_LIBS})
+
+# Register tests with CTest
+add_test(NAME task_model_test COMMAND task_model_test)
+add_test(NAME metrics_collector_test COMMAND metrics_collector_test)
+add_test(NAME task_tracer_test COMMAND task_tracer_test)
+add_test(NAME alert_manager_test COMMAND alert_manager_test)
+add_test(NAME worker_manager_test COMMAND worker_manager_test)
+add_test(NAME task_scheduler_test COMMAND task_scheduler_test)
+add_test(NAME control_plane_test COMMAND control_plane_test)
+
+endif()
