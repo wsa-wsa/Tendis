@@ -125,8 +125,8 @@ rocks.level0_stop_writes_trigger 36
 rocks.target_file_size_base 67108864
 rocks.max_bytes_for_level_base 268435456
 
-# Compaction settings
-rocks.compactOnExpiredKeysEnabled false
+# KVStore count (reduce for testing)
+kvStoreCount 1
 EOF
 
     # CaaS-LSM mode
@@ -193,20 +193,38 @@ start_tendisplus() {
     local instance_name="$1"
     local conf_file="$2"
     local log_file="${LOG_DIR}/tendisplus_${instance_name}.log"
-
-    log_info "Starting TendisPlus instance ${instance_name}..."
+    
+    # Extract port from config file
+    local port
+    port=$(grep "^port" "${conf_file}" | awk '{print $2}')
+    
+    log_info "Starting TendisPlus instance ${instance_name} on port ${port}..."
     ${TENDISPLUS_BIN} "${conf_file}" > "${log_file}" 2>&1 &
-    local pid=$!
-    PIDS+=($pid)
+    local launcher_pid=$!
     sleep 3
-
-    if kill -0 $pid 2>/dev/null; then
-        log_info "TendisPlus ${instance_name} started (PID: $pid)"
-    else
-        log_error "TendisPlus ${instance_name} failed to start. Check ${log_file}"
-        return 1
-    fi
-    echo $pid
+    
+    # TendisPlus daemonizes, so check by port instead of PID
+    local max_wait=10
+    local waited=0
+    while [[ $waited -lt $max_wait ]]; do
+        if nc -z 127.0.0.1 "${port}" 2>/dev/null; then
+            # Find the actual daemon PID
+            local daemon_pid
+            daemon_pid=$(pgrep -f "tendisplus.*${conf_file}" 2>/dev/null | head -1)
+            if [[ -n "$daemon_pid" ]]; then
+                PIDS+=($daemon_pid)
+                log_info "TendisPlus ${instance_name} started (PID: ${daemon_pid}, Port: ${port})"
+                echo $daemon_pid
+                return 0
+            fi
+        fi
+        sleep 1
+        ((waited++))
+    done
+    
+    log_error "TendisPlus ${instance_name} failed to start. Check ${log_file}"
+    cat "${log_file}" | tail -20 >&2
+    return 1
 }
 
 start_observatory() {
