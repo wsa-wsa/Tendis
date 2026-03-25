@@ -160,6 +160,10 @@ target_link_libraries(task_scheduler_test control_plane_core gtest_main ${SYS_LI
 add_executable(control_plane_test control_plane_test.cpp)
 target_link_libraries(control_plane_test control_plane_core gtest_main ${SYS_LIBS})
 
+# Layer 4: Framework validation test (功能正确性 + 设计优势)
+add_executable(framework_validation_test framework_validation_test.cpp)
+target_link_libraries(framework_validation_test control_plane_core gtest_main ${SYS_LIBS})
+
 # Register tests with CTest
 add_test(NAME task_model_test COMMAND task_model_test)
 add_test(NAME metrics_collector_test COMMAND metrics_collector_test)
@@ -168,5 +172,6 @@ add_test(NAME alert_manager_test COMMAND alert_manager_test)
 add_test(NAME worker_manager_test COMMAND worker_manager_test)
 add_test(NAME task_scheduler_test COMMAND task_scheduler_test)
 add_test(NAME control_plane_test COMMAND control_plane_test)
+add_test(NAME framework_validation_test COMMAND framework_validation_test)
 
 endif()

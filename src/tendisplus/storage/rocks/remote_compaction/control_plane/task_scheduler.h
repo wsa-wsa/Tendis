@@ -184,7 +184,8 @@ class TaskScheduler {
   void HandleRetry(std::shared_ptr<TaskInfo> task);
 
   // CaaS-LSM: 检查是否应该降级
-  bool ShouldFallback(const std::shared_ptr<TaskInfo>& task);
+  // NOTE: pending_size 由调用者传入，因为调用者已持有 pending_mutex_ 锁
+  bool ShouldFallback(const std::shared_ptr<TaskInfo>& task, size_t pending_size);
 
   // CaaS-LSM: 处理降级
   void HandleFallback(std::shared_ptr<TaskInfo> task, const std::string& reason);

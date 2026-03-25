@@ -289,13 +289,15 @@ void TaskScheduler::OnTaskCompleted(const std::string& task_id,
     statistics_.total_execution_time_ms += task->GetExecutionTimeMs();
     statistics_.total_queue_time_ms += task->GetQueueTimeMs();
   } else {
-    // 检查是否需要重试
+    // 先标记为 Failed，再检查是否需要重试
+    // (CanRetry() 依赖 status == kFailed/kTimeout/kRetrying)
+    task->status = TaskStatus::kFailed;
+    task->error_message = result.error_message;
+
     if (task->CanRetry()) {
       HandleRetry(task);
       return;
     }
-    task->status = TaskStatus::kFailed;
-    task->error_message = result.error_message;
     statistics_.total_failed++;
   }
 
@@ -515,7 +517,8 @@ void TaskScheduler::CSAStatusCheckLoop() {
           std::cout << "[TaskScheduler] Worker offline, rescheduling task: "
                     << task_id << std::endl;
           task->reschedule_count++;
-          if (ShouldFallback(task)) {
+          size_t cur_pending = GetPendingCount();
+          if (ShouldFallback(task, cur_pending)) {
             HandleFallback(task, "Worker offline and reschedule limit reached");
           } else {
             HandleRetry(task);
@@ -571,8 +574,8 @@ std::vector<SchedulingDecision> TaskScheduler::DoSchedule() {
   while (!pending_queue_.empty()) {
     auto task = pending_queue_.top();
 
-    // CaaS-LSM: 检查是否应该降级
-    if (ShouldFallback(task)) {
+    // CaaS-LSM: 检查是否应该降级（传入 pending_size 避免死锁）
+    if (ShouldFallback(task, pending_queue_.size())) {
       pending_queue_.pop();
       fallback_tasks.push_back(task);
       continue;
@@ -749,7 +752,8 @@ void TaskScheduler::HandleRetry(std::shared_ptr<TaskInfo> task) {
 }
 
 // CaaS-LSM: 检查是否应该降级到本地执行
-bool TaskScheduler::ShouldFallback(const std::shared_ptr<TaskInfo>& task) {
+bool TaskScheduler::ShouldFallback(const std::shared_ptr<TaskInfo>& task,
+                                   size_t pending_size) {
   if (!worker_manager_) {
     return true;  // 没有 WorkerManager，直接降级
   }
@@ -762,11 +766,7 @@ bool TaskScheduler::ShouldFallback(const std::shared_ptr<TaskInfo>& task) {
   }
 
   // 条件 2: 队列积压超过阈值
-  size_t pending_size = 0;
-  {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    pending_size = pending_queue_.size();
-  }
+  // NOTE: pending_size 由调用者传入，因为调用者已持有 pending_mutex_ 锁
   if (pending_size > config_.max_accumulation_in_procp) {
     std::cout << "[TaskScheduler] Fallback: Queue accumulation ("
               << pending_size << " > " << config_.max_accumulation_in_procp

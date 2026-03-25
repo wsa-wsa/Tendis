@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <memory>

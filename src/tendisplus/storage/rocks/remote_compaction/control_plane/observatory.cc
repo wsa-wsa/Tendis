@@ -1186,6 +1186,16 @@ std::string Observatory::TaskStatusToJsonString(::control_plane::TaskStatus stat
   }
 }
 
+std::string Observatory::TaskPriorityToJsonString(::control_plane::TaskPriority priority) {
+  switch (priority) {
+    case ::control_plane::PRIORITY_LOW: return "Low";
+    case ::control_plane::PRIORITY_NORMAL: return "Normal";
+    case ::control_plane::PRIORITY_HIGH: return "High";
+    case ::control_plane::PRIORITY_URGENT: return "Urgent";
+    default: return "Unknown";
+  }
+}
+
 std::string Observatory::WorkerStatusToJsonString(::control_plane::WorkerStatus status) {
   switch (status) {
     case ::control_plane::WORKER_ONLINE: return "Online";

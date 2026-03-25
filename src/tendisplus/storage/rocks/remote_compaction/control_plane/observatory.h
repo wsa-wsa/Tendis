@@ -144,6 +144,7 @@ class Observatory {
   // 辅助方法
   std::string JsonEscape(const std::string& s);
   std::string TaskStatusToJsonString(::control_plane::TaskStatus status);
+  std::string TaskPriorityToJsonString(::control_plane::TaskPriority priority);
   std::string WorkerStatusToJsonString(::control_plane::WorkerStatus status);
   int64_t GetCurrentTimeMs();
   

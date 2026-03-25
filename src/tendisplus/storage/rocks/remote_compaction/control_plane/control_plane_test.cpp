@@ -121,7 +121,7 @@ TEST(ControlPlane, TaskStatistics) {
         "node-stats", "db0", 0, 3000 + i, "input", "nfs://localhost/shared");
   }
 
-  auto stats = cp.GetTaskStatistics();
+  const auto& stats = cp.GetTaskStatistics();
   EXPECT_EQ(stats.total_submitted.load(), 3u);
 }
 
@@ -272,7 +272,7 @@ TEST(ControlPlane, ConcurrentSubmission) {
 
   EXPECT_EQ(all_ids.size(), static_cast<size_t>(kThreads * kTasksPerThread));
 
-  auto stats = cp.GetTaskStatistics();
+  const auto& stats = cp.GetTaskStatistics();
   EXPECT_EQ(stats.total_submitted.load(),
             static_cast<uint64_t>(kThreads * kTasksPerThread));
 }

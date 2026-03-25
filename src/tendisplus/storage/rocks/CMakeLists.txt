@@ -112,6 +112,8 @@ foreach(_target csa_server)
             "remote_compaction/${_target}.cc")
     add_dependencies(${_target} csa_grpc_proto)
     add_dependencies(${_target} shared_fs)
+    target_include_directories(${_target} PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}/remote_compaction/control_plane")
     target_link_libraries(${_target}
             #          compaction_service_helper
             csa_grpc_proto

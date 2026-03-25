@@ -508,7 +508,7 @@ bool WorkerManager::DistributeJobToCSA(const std::string& worker_id,
   }
   
   // 创建 CSAService::Stub 并调用 DistributeCompactionJob RPC
-  auto stub = control_plane::CSAService::NewStub(channel);
+  auto stub = ::control_plane::CSAService::NewStub(channel);
   if (!stub) {
     std::cerr << "[WorkerManager] Failed to create CSAService stub for: "
               << worker->address << std::endl;
@@ -516,7 +516,7 @@ bool WorkerManager::DistributeJobToCSA(const std::string& worker_id,
   }
 
   // 构建请求
-  control_plane::DistributeJobRequest request;
+  ::control_plane::DistributeJobRequest request;
   request.set_task_id(task_id);
   request.set_compaction_args(compaction_args);
   request.set_compaction_addition_info(compaction_addition_info);
@@ -531,7 +531,7 @@ bool WorkerManager::DistributeJobToCSA(const std::string& worker_id,
   context.set_deadline(deadline);
 
   // 调用 RPC
-  control_plane::DistributeJobResponse response;
+  ::control_plane::DistributeJobResponse response;
   grpc::Status grpc_status =
     stub->DistributeCompactionJob(&context, request, &response);
 
@@ -597,7 +597,7 @@ bool WorkerManager::DistributeBulkLoadShardToCSA(
   }
 
   // 创建 CSAService::Stub 并调用 ExecuteBulkLoadShard RPC
-  auto stub = control_plane::CSAService::NewStub(channel);
+  auto stub = ::control_plane::CSAService::NewStub(channel);
   if (!stub) {
     std::cerr << "[WorkerManager] BulkLoad: Failed to create stub for: "
               << worker->address << std::endl;
@@ -605,15 +605,15 @@ bool WorkerManager::DistributeBulkLoadShardToCSA(
   }
 
   // 构建 BulkLoadShardRequest
-  control_plane::BulkLoadShardRequest request;
+  ::control_plane::BulkLoadShardRequest request;
   request.set_task_id(task_id);
   request.set_shard_id(shard_id);
   request.set_shard_index(shard_index);
   request.set_source_type(
-    static_cast<control_plane::DataSourceType>(source_type));
+    static_cast<::control_plane::DataSourceType>(source_type));
   request.set_source_path(source_path);
   request.set_data_format(
-    static_cast<control_plane::DataFormat>(data_format));
+    static_cast<::control_plane::DataFormat>(data_format));
 
   // Key 范围
   auto* key_range = request.mutable_key_range();
@@ -626,7 +626,7 @@ bool WorkerManager::DistributeBulkLoadShardToCSA(
   request.set_shared_fs_uri(shared_fs_uri);
   request.set_sst_output_dir(sst_output_dir);
   request.set_compression(
-    static_cast<control_plane::CompressionType>(compression));
+    static_cast<::control_plane::CompressionType>(compression));
   request.set_target_sst_size(target_sst_size);
   request.set_generate_binlog(generate_binlog);
   request.set_target_store_id(target_store_id);
@@ -643,7 +643,7 @@ bool WorkerManager::DistributeBulkLoadShardToCSA(
   context.set_deadline(deadline);
 
   // 调用 RPC
-  control_plane::BulkLoadShardResponse response;
+  ::control_plane::BulkLoadShardResponse response;
   grpc::Status grpc_status =
     stub->ExecuteBulkLoadShard(&context, request, &response);
 
@@ -690,7 +690,7 @@ bool WorkerManager::CancelCSATask(const std::string& worker_id,
   }
   
   // 创建 CSAService::Stub 并调用 CancelRunningTask RPC
-  auto stub = control_plane::CSAService::NewStub(channel);
+  auto stub = ::control_plane::CSAService::NewStub(channel);
   if (!stub) {
     std::cerr << "[WorkerManager] CancelCSATask: failed to create stub for: "
               << worker->address << std::endl;
@@ -698,7 +698,7 @@ bool WorkerManager::CancelCSATask(const std::string& worker_id,
   }
 
   // 构建请求
-  control_plane::CancelRunningTaskRequest request;
+  ::control_plane::CancelRunningTaskRequest request;
   request.set_task_id(task_id);
   request.set_reason("Cancelled by Control Plane");
 
@@ -709,7 +709,7 @@ bool WorkerManager::CancelCSATask(const std::string& worker_id,
   context.set_deadline(deadline);
 
   // 调用 RPC
-  control_plane::CancelRunningTaskResponse response;
+  ::control_plane::CancelRunningTaskResponse response;
   grpc::Status grpc_status =
     stub->CancelRunningTask(&context, request, &response);
 

@@ -73,11 +73,6 @@ class IngesterFSCache {
       return it->second.env.get();
     }
 
-    struct CachedEntry {
-      std::shared_ptr<rocksdb::FileSystem> fs;
-      std::unique_ptr<rocksdb::Env> env;
-    };
-
     CachedEntry entry;
     entry.fs = shared_fs;
     entry.env = std::move(env);

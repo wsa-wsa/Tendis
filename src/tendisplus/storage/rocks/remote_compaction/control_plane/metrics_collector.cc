@@ -5,6 +5,7 @@
 #include "metrics_collector.h"
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 
 namespace tendisplus {
