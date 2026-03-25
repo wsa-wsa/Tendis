@@ -313,7 +313,11 @@ void ControlPlaneWorker::HeartbeatLoop() {
         for (const auto& task_id : response.tasks_to_cancel()) {
           std::cout << "[ControlPlaneWorker] Task cancelled by control plane: "
                     << task_id << std::endl;
-          // TODO: 实现任务取消逻辑
+          // 将取消的任务 ID 加入取消集合
+          {
+            std::lock_guard<std::mutex> lock(cancel_mutex_);
+            cancelled_task_ids_.insert(task_id);
+          }
         }
       }
     }
@@ -398,6 +402,23 @@ void ControlPlaneWorker::TaskFetchLoop() {
       std::cout << "[ControlPlaneWorker] Executing task: " << task.task_id
                 << std::endl;
 
+      // 检查任务在执行前是否已被取消
+      if (IsTaskCancelled(task.task_id)) {
+        std::cout << "[ControlPlaneWorker] Task already cancelled, skipping: "
+                  << task.task_id << std::endl;
+        // 上报取消结果
+        TaskExecutionResult cancel_result;
+        cancel_result.success = false;
+        cancel_result.error_message = "Task cancelled before execution";
+        ReportTaskResult(task.task_id, cancel_result);
+        // 清理取消标志
+        {
+          std::lock_guard<std::mutex> lock(cancel_mutex_);
+          cancelled_task_ids_.erase(task.task_id);
+        }
+        continue;
+      }
+
       // 增加活跃任务计数
       active_tasks_++;
       {
@@ -423,6 +444,12 @@ void ControlPlaneWorker::TaskFetchLoop() {
           active_task_ids_.end());
       }
       active_tasks_--;
+
+      // 清理取消集合中的条目（如果有）
+      {
+        std::lock_guard<std::mutex> lock(cancel_mutex_);
+        cancelled_task_ids_.erase(task.task_id);
+      }
 
       std::cout << "[ControlPlaneWorker] Task completed: " << task.task_id
                 << ", success=" << result.success << std::endl;

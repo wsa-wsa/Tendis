@@ -19,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace tendisplus {
@@ -158,6 +159,12 @@ class ControlPlaneWorker {
     return active_tasks_.load();
   }
 
+  // 检查某个任务是否已被取消
+  bool IsTaskCancelled(const std::string& task_id) const {
+    std::lock_guard<std::mutex> lock(cancel_mutex_);
+    return cancelled_task_ids_.count(task_id) > 0;
+  }
+
  private:
   // 向控制平面注册
   bool RegisterWithControlPlane();
@@ -200,6 +207,10 @@ class ControlPlaneWorker {
   // 当前运行的任务 ID 列表
   std::vector<std::string> active_task_ids_;
   std::mutex tasks_mutex_;
+
+  // 已取消的任务 ID 集合（由心跳线程写入，任务执行线程读取）
+  std::unordered_set<std::string> cancelled_task_ids_;
+  mutable std::mutex cancel_mutex_;
 
   // gRPC
   std::shared_ptr<grpc::Channel> channel_;

@@ -476,10 +476,51 @@ bool WorkerManager::CheckCSAStatus(const std::string& worker_id) {
     return false;
   }
   
-  // TODO: 可以通过 gRPC 调用 CSAService::CheckCSAStatus 获取详细状态
-  // 这里简单返回连接状态
-  
-  return true;
+  // 通过 gRPC 调用 CSAService::CheckCSAStatus 获取详细状态
+  auto stub = ::control_plane::CSAService::NewStub(channel);
+  if (!stub) {
+    std::cerr << "[WorkerManager] Failed to create CSAService stub for: "
+              << worker->address << std::endl;
+    return false;
+  }
+
+  ::control_plane::CSAStatusRequest request;
+  ::control_plane::CSAStatusResponse response;
+  grpc::ClientContext context;
+
+  auto deadline =
+    std::chrono::system_clock::now() + std::chrono::seconds(5);
+  context.set_deadline(deadline);
+
+  grpc::Status grpc_status =
+    stub->CheckCSAStatus(&context, request, &response);
+
+  if (!grpc_status.ok()) {
+    std::cerr << "[WorkerManager] CheckCSAStatus RPC failed: "
+              << grpc_status.error_message()
+              << " (worker=" << worker_id << ")" << std::endl;
+    return false;
+  }
+
+  // 更新 Worker 的资源信息
+  {
+    std::lock_guard<std::mutex> lock(workers_mutex_);
+    auto it = workers_.find(worker_id);
+    if (it != workers_.end()) {
+      auto& w = it->second;
+      w->resources.active_tasks = response.local_task_nums();
+      if (response.total_memory_mb() > 0) {
+        w->resources.total_memory_mb = response.total_memory_mb();
+        w->resources.used_memory_mb = response.used_memory_mb();
+      }
+      if (response.total_disk_mb() > 0) {
+        w->resources.total_disk_mb = response.total_disk_mb();
+        w->resources.used_disk_mb = response.used_disk_mb();
+      }
+    }
+  }
+
+  return response.is_healthy();
 }
 
 bool WorkerManager::DistributeJobToCSA(const std::string& worker_id,

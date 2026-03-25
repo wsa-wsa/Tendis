@@ -17,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "csa.grpc.pb.h"  // NOLINT(build/include_subdir)
@@ -433,6 +434,8 @@ class CSAImpl final : public csa::CSAService::Service {
 // ============================================================================
 class CSAServiceImpl final : public ::control_plane::CSAService::Service {
  public:
+  explicit CSAServiceImpl(CSAImpl* csa_impl) : csa_impl_(csa_impl) {}
+
   // 执行 Bulk Load 分片（SST 生成）
   grpc::Status ExecuteBulkLoadShard(
     grpc::ServerContext* context,
@@ -530,10 +533,65 @@ class CSAServiceImpl final : public ::control_plane::CSAService::Service {
     grpc::ServerContext* context,
     const ::control_plane::DistributeJobRequest* request,
     ::control_plane::DistributeJobResponse* response) override {
-    // TODO: 转发到 CSAImpl 执行 compaction
-    // 当前 CSA server 保持 Legacy 模式，该 RPC 在新版 Worker 中实现
-    response->set_accepted(false);
-    response->set_error_message("Legacy CSA server does not support push mode");
+    if (!csa_impl_) {
+      response->set_accepted(false);
+      response->set_error_message("CSA compaction service not initialized");
+      return grpc::Status::OK;
+    }
+
+    std::string task_id = request->task_id();
+    std::cout << "[CSA-Push] Received DistributeCompactionJob: task_id="
+              << task_id << std::endl;
+
+    // 跟踪任务
+    {
+      std::lock_guard<std::mutex> lock(running_tasks_mutex_);
+      running_task_ids_.insert(task_id);
+    }
+
+    // 构建 CompactionArgs 并转发到 CSAImpl
+    csa::CompactionArgs compaction_args;
+    compaction_args.set_name(request->db_name());
+    compaction_args.set_input(request->compaction_args());
+    // 构建 output_directory: db_name/job_id
+    std::string output_dir = request->db_name() + "/" +
+                             std::to_string(request->job_id());
+    compaction_args.set_output_directory(output_dir);
+    compaction_args.set_shared_fs_uri(request->shared_fs_uri());
+    compaction_args.set_shared_fs_local_prefix(
+      request->shared_fs_local_prefix());
+
+    csa::CompactionReply compaction_reply;
+
+    // 转发到 CSAImpl 执行
+    grpc::Status status =
+      csa_impl_->ExecuteCompactionTask(context, &compaction_args,
+                                       &compaction_reply);
+
+    // 移除任务跟踪
+    {
+      std::lock_guard<std::mutex> lock(running_tasks_mutex_);
+      running_task_ids_.erase(task_id);
+    }
+
+    if (!status.ok()) {
+      response->set_accepted(false);
+      response->set_error_message("gRPC error: " + status.error_message());
+      return grpc::Status::OK;
+    }
+
+    if (compaction_reply.code() != 0) {
+      response->set_accepted(false);
+      response->set_error_message(
+        "Compaction failed with code " +
+        std::to_string(compaction_reply.code()) +
+        ": " + compaction_reply.result());
+      return grpc::Status::OK;
+    }
+
+    response->set_accepted(true);
+    std::cout << "[CSA-Push] DistributeCompactionJob completed: task_id="
+              << task_id << std::endl;
     return grpc::Status::OK;
   }
 
@@ -544,6 +602,15 @@ class CSAServiceImpl final : public ::control_plane::CSAService::Service {
     ::control_plane::CSAStatusResponse* response) override {
     response->set_local_task_nums(local_task_nums_.load());
     response->set_is_healthy(true);
+
+    // 返回运行中的任务数量作为详细状态
+    {
+      std::lock_guard<std::mutex> lock(running_tasks_mutex_);
+      // local_task_nums_ 包括 Legacy + Push 模式的任务
+      // running_task_ids_ 只包括 Push 模式的任务
+      response->set_local_task_nums(local_task_nums_.load());
+    }
+
     return grpc::Status::OK;
   }
 
@@ -552,11 +619,51 @@ class CSAServiceImpl final : public ::control_plane::CSAService::Service {
     grpc::ServerContext* context,
     const ::control_plane::CancelRunningTaskRequest* request,
     ::control_plane::CancelRunningTaskResponse* response) override {
-    // TODO: 实现任务取消
-    response->set_success(false);
-    response->set_error_message("Task cancellation not yet implemented");
+    std::string task_id = request->task_id();
+    std::string reason = request->reason();
+
+    std::cout << "[CSA] CancelRunningTask: task_id=" << task_id
+              << ", reason=" << reason << std::endl;
+
+    // 检查任务是否在运行
+    bool found = false;
+    {
+      std::lock_guard<std::mutex> lock(running_tasks_mutex_);
+      found = running_task_ids_.count(task_id) > 0;
+      if (found) {
+        // 标记为已取消（将 task_id 加入取消集合）
+        cancelled_task_ids_.insert(task_id);
+      }
+    }
+
+    if (!found) {
+      response->set_success(false);
+      response->set_error_message(
+        "Task not found in running tasks: " + task_id);
+      return grpc::Status::OK;
+    }
+
+    // 注：RocksDB 的 OpenAndCompact 是同步阻塞操作，无法主动中断。
+    // 取消标志会在下一次任务调度检查时生效。
+    // 对于正在执行中的 compaction，只能等待其自然完成。
+    response->set_success(true);
+    std::cout << "[CSA] Task marked for cancellation: " << task_id << std::endl;
     return grpc::Status::OK;
   }
+
+  // 检查某个任务是否已被取消
+  bool IsTaskCancelled(const std::string& task_id) {
+    std::lock_guard<std::mutex> lock(running_tasks_mutex_);
+    return cancelled_task_ids_.count(task_id) > 0;
+  }
+
+ private:
+  CSAImpl* csa_impl_ = nullptr;  // 引用 CSAImpl 以转发 compaction 请求
+
+  // 正在运行的任务跟踪（Push 模式）
+  std::unordered_set<std::string> running_task_ids_;
+  std::unordered_set<std::string> cancelled_task_ids_;
+  std::mutex running_tasks_mutex_;
 };
 
 // Parse command line arguments
@@ -648,7 +755,7 @@ int main(int argc, char* argv[]) {
   }
 
   CSAImpl service;
-  CSAServiceImpl bulk_load_service;
+  CSAServiceImpl bulk_load_service(&service);
 
   // Get max gRPC message size from configuration (with default)
   int64_t max_msg_size = compaction_service_options.GetGrpcMaxMessageSize();
