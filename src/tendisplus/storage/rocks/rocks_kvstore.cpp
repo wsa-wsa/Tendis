@@ -2433,7 +2433,9 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
         _stats,
         remote_listeners,
         remote_table_properties_collector_factories,
-        remote_options);
+        remote_options,
+        dbId(),  // store_id
+        (gParams ? gParams->bindIp + ":" + std::to_string(gParams->port) : ""));
       tmp_options.compaction_service = compaction_svc;
       auto status = rocksdb::OptimisticTransactionDB::Open(
         dbOpts,
@@ -2518,7 +2520,9 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
         compaction_stats,
         remote_listeners,
         remote_table_properties_collector_factories,
-        remote_options);
+        remote_options,
+        dbId(),  // store_id
+        (gParams ? gParams->bindIp + ":" + std::to_string(gParams->port) : ""));
       tmp_options.compaction_service = compaction_svc;
 
       // open two colum_family in pessimisticTranDB

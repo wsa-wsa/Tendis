@@ -235,9 +235,36 @@ std::string ConvertLocalPathToSharedURI(const std::string& local_path,
 }
 
 bool IsSharedFilesystemURI(const std::string& path) {
+  // Note: file:// is NOT a shared filesystem - it's a local filesystem URI.
+  // Only remote/distributed filesystems count as "shared".
   return path.find("nfs://") == 0 || path.find("hdfs://") == 0 ||
-    path.find("s3://") == 0 || path.find("gcs://") == 0 ||
-    path.find("file://") == 0;
+    path.find("s3://") == 0 || path.find("gcs://") == 0;
+}
+
+// Helper: Strip file:// URI prefix and return local path
+// e.g., "file:///data/db" -> "/data/db"
+//       "file://localhost/data/db" -> "/data/db"
+//       "/data/db" -> "/data/db" (unchanged)
+std::string StripFileURIPrefix(const std::string& path) {
+  if (path.find("file://") != 0) {
+    return path;  // Not a file:// URI, return as-is
+  }
+  // Skip "file://"
+  std::string after_scheme = path.substr(7);
+  if (after_scheme.empty()) {
+    return "/";
+  }
+  // file:///path -> /path (authority is empty)
+  if (after_scheme[0] == '/') {
+    return after_scheme;
+  }
+  // file://localhost/path -> /path (skip authority)
+  size_t slash_pos = after_scheme.find('/');
+  if (slash_pos != std::string::npos) {
+    return after_scheme.substr(slash_pos);
+  }
+  // file://something (no path after authority)
+  return "/";
 }
 
 }  // namespace ROCKSDB_NAMESPACE

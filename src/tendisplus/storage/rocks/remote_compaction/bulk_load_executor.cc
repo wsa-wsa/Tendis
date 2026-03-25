@@ -103,9 +103,15 @@ class BulkLoadFSCache {
 // BulkLoadExecutor 主执行流程
 // ============================================================================
 BulkLoadExecuteResult BulkLoadExecutor::Execute(
-  const BulkLoadExecuteParams& params) {
+  const BulkLoadExecuteParams& raw_params) {
   BulkLoadExecuteResult result;
   auto start_time = std::chrono::steady_clock::now();
+
+  // Strip file:// URI prefix from paths (file:// is local, not shared)
+  BulkLoadExecuteParams params = raw_params;
+  params.sst_output_dir = rocksdb::StripFileURIPrefix(params.sst_output_dir);
+  params.source_path = rocksdb::StripFileURIPrefix(params.source_path);
+  params.target_db_path = rocksdb::StripFileURIPrefix(params.target_db_path);
 
   std::cout << "[BulkLoadExecutor] Starting execution:"
             << " task_id=" << params.task_id

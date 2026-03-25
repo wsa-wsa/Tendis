@@ -37,6 +37,11 @@ std::string ConvertLocalPathToSharedURI(const std::string& local_path,
 // Helper: Check if a path is a shared filesystem URI
 bool IsSharedFilesystemURI(const std::string& path);
 
+// Helper: Strip file:// URI prefix and return local path
+// e.g., "file:///data/db" -> "/data/db"
+//       "/data/db" -> "/data/db" (unchanged)
+std::string StripFileURIPrefix(const std::string& path);
+
 // Unified interface for registering additional path prefixes to shared
 // filesystem This is useful for path-based filesystems (like NFS) that need to
 // know which local paths should be mapped to the shared storage. For URI-based

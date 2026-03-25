@@ -467,10 +467,12 @@ TaskExecutionResult ControlPlaneWorker::ExecuteCompaction(
   }
 
   std::string compaction_output;
-  std::string output_dir = task.db_name + "/" + std::to_string(task.job_id);
+  // Strip file:// URI prefix if present (file:// is local filesystem, not shared)
+  std::string db_name = rocksdb::StripFileURIPrefix(task.db_name);
+  std::string output_dir = db_name + "/" + std::to_string(task.job_id);
 
   ROCKSDB_NAMESPACE::Status s = ROCKSDB_NAMESPACE::DB::OpenAndCompact(
-    task.db_name,
+    db_name,
     output_dir,
     task.compaction_input,
     &compaction_output,

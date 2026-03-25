@@ -31,7 +31,9 @@ class MyTestCompactionService : public CompactionService {
     std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
       table_properties_collector_factories,
     const RemoteOpenAndCompactOptions& remote_options =
-      RemoteOpenAndCompactOptions())
+      RemoteOpenAndCompactOptions(),
+    const std::string& store_id = "0",
+    const std::string& source_node_id = "")
     : db_path_(std::move(db_path)),
       options_(options),
       statistics_(statistics),
@@ -40,7 +42,11 @@ class MyTestCompactionService : public CompactionService {
       listeners_(listeners),
       table_properties_collector_factories_(
         std::move(table_properties_collector_factories)),
-      remote_options_(remote_options) {
+      remote_options_(remote_options),
+      store_id_(store_id),
+      source_node_id_(source_node_id.empty()
+        ? "tendisplus:" + db_path_
+        : source_node_id) {
     // 初始化远程 Compaction 支持
     InitRemoteCompaction();
   }
@@ -167,6 +173,10 @@ class MyTestCompactionService : public CompactionService {
 
   // Remote compaction configuration (all settings from config file)
   RemoteOpenAndCompactOptions remote_options_;
+
+  // Store identification for task tracking
+  std::string store_id_;          // KVStore ID (e.g., "0", "1", "2", ...)
+  std::string source_node_id_;    // Source node identifier (e.g., "127.0.0.1:8903")
 
   // =========================================================================
   // Control Plane 模式

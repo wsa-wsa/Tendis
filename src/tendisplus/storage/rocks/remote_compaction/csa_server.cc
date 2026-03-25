@@ -277,6 +277,10 @@ class CSAImpl final : public csa::CSAService::Service {
     std::string output_directory = compaction_args->output_directory();
     std::string compaction_input = compaction_args->input();
 
+    // Strip file:// URI prefix if present (file:// is local filesystem, not shared)
+    db_path = rocksdb::StripFileURIPrefix(db_path);
+    output_directory = rocksdb::StripFileURIPrefix(output_directory);
+
     // Shared storage mode: use shared filesystem (read-only)
     // CSA server reads from shared storage via URI, writes output to shared
     // storage Tendisplus will install results from output directory to final

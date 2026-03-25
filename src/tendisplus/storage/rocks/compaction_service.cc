@@ -322,8 +322,8 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteViaControlPla
   }
 
   // 构建源节点 ID（用于任务追踪）
-  // TODO: 从 ServerParams 获取实际的 bind:port
-  std::string source_node_id = "tendisplus:" + db_path_;
+  // 使用构造时传入的 source_node_id（格式: "bindIp:port"）
+  std::string source_node_id = source_node_id_;
 
   // 提交任务到 Control Plane
   std::cerr << "[CompactionService] Submitting task to Control Plane..."
@@ -331,12 +331,23 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteViaControlPla
   std::cerr << "[CompactionService] DB Path URI: " << db_path_uri << std::endl;
   std::cerr << "[CompactionService] Shared FS URI: "
             << remote_options_.shared_fs_uri << std::endl;
+  std::cerr << "[CompactionService] Source Node: " << source_node_id
+            << ", Store ID: " << store_id_ << std::endl;
   std::cerr.flush();
+
+  // 解析 store_id 为整数
+  uint32_t store_id_num = 0;
+  try {
+    store_id_num = static_cast<uint32_t>(std::stoul(store_id_));
+  } catch (...) {
+    std::cerr << "[CompactionService] WARNING: Failed to parse store_id '"
+              << store_id_ << "', using 0" << std::endl;
+  }
 
   SubmitResult submit_result = control_plane_client_->SubmitCompactionTask(
     source_node_id,
     db_path_uri,
-    0,  // store_id - TODO: 从 info 获取
+    store_id_num,  // store_id from KVStore
     info.job_id,
     compaction_input,
     remote_options_.shared_fs_uri,
