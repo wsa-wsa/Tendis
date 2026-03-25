@@ -546,6 +546,13 @@ class CSAServiceImpl final : public ::control_plane::CSAService::Service {
     // 跟踪任务
     {
       std::lock_guard<std::mutex> lock(running_tasks_mutex_);
+      // 检查任务是否在加入之前就已被取消
+      if (cancelled_task_ids_.count(task_id) > 0) {
+        cancelled_task_ids_.erase(task_id);
+        response->set_accepted(false);
+        response->set_error_message("Task already cancelled: " + task_id);
+        return grpc::Status::OK;
+      }
       running_task_ids_.insert(task_id);
     }
 
@@ -568,10 +575,11 @@ class CSAServiceImpl final : public ::control_plane::CSAService::Service {
       csa_impl_->ExecuteCompactionTask(context, &compaction_args,
                                        &compaction_reply);
 
-    // 移除任务跟踪
+    // 移除任务跟踪并清理取消标志
     {
       std::lock_guard<std::mutex> lock(running_tasks_mutex_);
       running_task_ids_.erase(task_id);
+      cancelled_task_ids_.erase(task_id);
     }
 
     if (!status.ok()) {
@@ -600,15 +608,15 @@ class CSAServiceImpl final : public ::control_plane::CSAService::Service {
     grpc::ServerContext* context,
     const ::control_plane::CSAStatusRequest* request,
     ::control_plane::CSAStatusResponse* response) override {
+    // local_task_nums_ 包括 Legacy + Push 模式的所有任务
     response->set_local_task_nums(local_task_nums_.load());
     response->set_is_healthy(true);
 
-    // 返回运行中的任务数量作为详细状态
-    {
-      std::lock_guard<std::mutex> lock(running_tasks_mutex_);
-      // local_task_nums_ 包括 Legacy + Push 模式的任务
-      // running_task_ids_ 只包括 Push 模式的任务
-      response->set_local_task_nums(local_task_nums_.load());
+    // 检查是否超过最大并发任务数来判断健康状态
+    int64_t max_tasks = GetMaxConcurrentTasks();
+    if (local_task_nums_.load() >= max_tasks) {
+      // 服务器忙碌但仍然健康
+      response->set_is_healthy(true);
     }
 
     return grpc::Status::OK;
