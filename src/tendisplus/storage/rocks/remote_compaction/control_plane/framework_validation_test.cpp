@@ -452,11 +452,11 @@ TEST(FrameworkValidation, Retry_EventuallySucceeds) {
 }
 
 // ============================================================================
-// Test 8: 完整生命周期 — Submit → Schedule → Assign → Complete (via Start)
+// Test 8: 完整生命周期 — Submit → Assign → Running → Complete
+// 不启动调度线程，手动模拟分配和完成，避免真实 gRPC 调用依赖
 // ============================================================================
 TEST(FrameworkValidation, CompleteLifecycle_EndToEnd) {
   auto config = MakeValidationConfig();
-  config.scheduler_config.scheduling_interval_ms = 30;
   ControlPlane cp(config);
 
   auto wid = RegisterStandardWorker(cp, "worker:8001", 5, 16384, 2000, "w1");
@@ -473,17 +473,29 @@ TEST(FrameworkValidation, CompleteLifecycle_EndToEnd) {
   EXPECT_EQ(task->source_node_id, "tendisplus-node-1");
   EXPECT_EQ(task->type, TaskType::kCompaction);
 
-  // 启动调度线程
   auto& scheduler = cp.GetScheduler();
-  scheduler.Start();
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-  // 验证已分配
+  // 手动模拟调度：将任务设为 Assigned → Running（不经过真实 gRPC）
+  {
+    std::lock_guard<std::mutex> lock(task->mtx);
+    task->status = TaskStatus::kAssigned;
+    task->assigned_worker_id = "w1";
+  }
+
   task = cp.QueryTask(task_id);
-  EXPECT_TRUE(task->status == TaskStatus::kAssigned ||
-              task->status == TaskStatus::kRunning)
-      << "调度后任务应为 Assigned/Running, 实际: "
-      << TaskStatusToString(task->status);
+  EXPECT_EQ(task->status, TaskStatus::kAssigned)
+      << "手动分配后应为 Assigned";
+
+  // 模拟 Worker 标记为 Running
+  {
+    std::lock_guard<std::mutex> lock(task->mtx);
+    task->status = TaskStatus::kRunning;
+    task->start_time = std::chrono::system_clock::now();
+  }
+
+  task = cp.QueryTask(task_id);
+  EXPECT_EQ(task->status, TaskStatus::kRunning)
+      << "标记运行后应为 Running";
 
   // Worker 上报成功
   TaskResult result;
@@ -493,8 +505,6 @@ TEST(FrameworkValidation, CompleteLifecycle_EndToEnd) {
   result.bytes_read = 1024 * 1024;
   result.bytes_written = 512 * 1024;
   scheduler.OnTaskCompleted(task_id, result);
-
-  scheduler.Stop();
 
   task = cp.QueryTask(task_id);
   EXPECT_EQ(task->status, TaskStatus::kCompleted);

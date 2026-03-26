@@ -164,6 +164,14 @@ target_link_libraries(control_plane_test control_plane_core gtest_main ${SYS_LIB
 add_executable(framework_validation_test framework_validation_test.cpp)
 target_link_libraries(framework_validation_test control_plane_core gtest_main ${SYS_LIBS})
 
+# Layer 5: Concurrency safety test (并发安全验证)
+add_executable(concurrency_safety_test concurrency_safety_test.cpp)
+target_link_libraries(concurrency_safety_test control_plane_core gtest_main ${SYS_LIBS})
+
+# Layer 6: Regression test (回归测试)
+add_executable(regression_test regression_test.cpp)
+target_link_libraries(regression_test control_plane_core gtest_main ${SYS_LIBS})
+
 # Register tests with CTest
 add_test(NAME task_model_test COMMAND task_model_test)
 add_test(NAME metrics_collector_test COMMAND metrics_collector_test)
@@ -173,5 +181,7 @@ add_test(NAME worker_manager_test COMMAND worker_manager_test)
 add_test(NAME task_scheduler_test COMMAND task_scheduler_test)
 add_test(NAME control_plane_test COMMAND control_plane_test)
 add_test(NAME framework_validation_test COMMAND framework_validation_test)
+add_test(NAME concurrency_safety_test COMMAND concurrency_safety_test)
+add_test(NAME regression_test COMMAND regression_test)
 
 endif()

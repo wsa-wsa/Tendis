@@ -204,6 +204,10 @@ class ControlPlaneWorker {
   std::atomic<bool> registered_{false};
   std::atomic<uint32_t> active_tasks_{0};
 
+  // 问题13 修复: 心跳连续失败计数（超过阈值才触发重注册）
+  uint32_t heartbeat_consecutive_failures_{0};
+  static constexpr uint32_t kMaxHeartbeatFailures = 3;
+
   // 当前运行的任务 ID 列表
   std::vector<std::string> active_task_ids_;
   std::mutex tasks_mutex_;
@@ -214,12 +218,19 @@ class ControlPlaneWorker {
 
   // gRPC
   std::shared_ptr<grpc::Channel> channel_;
+  // 问题12: 缓存的 gRPC stub（避免每次调用 NewStub）
+  std::shared_ptr<void> cached_stub_;
 
   // 线程
   std::unique_ptr<std::thread> heartbeat_thread_;
   std::unique_ptr<std::thread> task_fetch_thread_;
   std::condition_variable cv_;
   std::mutex cv_mutex_;
+
+  // 第五轮修复 (NEW-12): 任务执行线程池（可 join 的线程替代 detach）
+  // Stop() 时 join 所有任务线程，防止 use-after-free
+  std::vector<std::thread> task_worker_threads_;
+  std::mutex task_workers_mutex_;
 
   // 系统资源信息
   uint32_t cpu_cores_ = 0;

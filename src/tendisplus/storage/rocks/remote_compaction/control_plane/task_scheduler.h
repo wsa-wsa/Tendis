@@ -77,6 +77,8 @@ struct SchedulerConfig {
   uint32_t max_reschedule = 5;               // 最大重调度次数
   double min_memory_free_ratio = 0.3;        // CSA 最小内存空闲率
   uint32_t csa_status_check_interval_sec = 5;// CSA 状态检查间隔
+  uint32_t completed_task_retention_sec = 3600;  // 已完成任务保留时长 (默认 1 小时)
+  uint32_t completed_task_cleanup_interval_sec = 300;  // 清理间隔 (默认 5 分钟)
 };
 
 // ============================================================================
@@ -204,6 +206,9 @@ class TaskScheduler {
   // 通知任务完成
   void NotifyTaskCompleted(const std::string& task_id, const TaskResult& result);
 
+  // 清理已完成的任务 (从 all_tasks_ 中移除过期的终态任务)
+  void CleanupCompletedTasks();
+
   SchedulerConfig config_;
   std::atomic<bool> running_{false};
 
@@ -263,8 +268,9 @@ class TaskScheduler {
   std::unordered_map<std::string, std::shared_ptr<TaskInfo>> running_tasks_;
   mutable std::mutex running_mutex_;
 
-  // 任务完成等待
-  std::unordered_map<std::string, std::condition_variable> task_cv_map_;
+  // 任务完成等待 (使用 unique_ptr 包装 condition_variable，
+  // 避免 unordered_map rehash 时移动不可移动对象导致 UB)
+  std::unordered_map<std::string, std::unique_ptr<std::condition_variable>> task_cv_map_;
   std::mutex task_cv_mutex_;
 
   // 回调

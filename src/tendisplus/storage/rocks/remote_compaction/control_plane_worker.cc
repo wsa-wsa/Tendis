@@ -160,6 +160,9 @@ void ControlPlaneWorker::Start() {
     return;
   }
 
+  // 问题12: 创建并缓存 gRPC stub
+  cached_stub_ = control_plane::ControlPlaneService::NewStub(channel_);
+
   // 注册到控制平面
   if (!RegisterWithControlPlane()) {
     std::cerr << "[ControlPlaneWorker] Failed to register with control plane"
@@ -198,6 +201,21 @@ void ControlPlaneWorker::Stop() {
     task_fetch_thread_->join();
   }
 
+  // 第五轮修复 (NEW-12): join 所有任务执行线程，防止 use-after-free
+  {
+    std::lock_guard<std::mutex> lock(task_workers_mutex_);
+    for (auto& t : task_worker_threads_) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
+    task_worker_threads_.clear();
+  }
+
+  // 清理 gRPC 资源
+  cached_stub_.reset();
+  channel_.reset();
+
   std::cout << "[ControlPlaneWorker] Stopped" << std::endl;
 }
 
@@ -214,11 +232,11 @@ std::shared_ptr<grpc::Channel> ControlPlaneWorker::CreateChannel() {
 }
 
 bool ControlPlaneWorker::RegisterWithControlPlane() {
-  if (!channel_) {
+  if (!channel_ || !cached_stub_) {
     return false;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto* stub = static_cast<control_plane::ControlPlaneService::Stub*>(cached_stub_.get());
 
   control_plane::RegisterWorkerRequest request;
   if (!config_.worker_id.empty()) {
@@ -276,7 +294,7 @@ void ControlPlaneWorker::HeartbeatLoop() {
       }
     } else {
       // 发送心跳
-      auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+      auto* stub = static_cast<control_plane::ControlPlaneService::Stub*>(cached_stub_.get());
 
       control_plane::HeartbeatRequest request;
       request.set_worker_id(worker_id_);
@@ -306,10 +324,23 @@ void ControlPlaneWorker::HeartbeatLoop() {
       grpc::Status status = stub->WorkerHeartbeat(&context, request, &response);
 
       if (!status.ok()) {
-        std::cerr << "[ControlPlaneWorker] Heartbeat failed: "
+        // 问题13 修复: 心跳失败时递增连续失败计数，超过阈值才触发重注册
+        heartbeat_consecutive_failures_++;
+        std::cerr << "[ControlPlaneWorker] Heartbeat failed ("
+                  << heartbeat_consecutive_failures_ << "/"
+                  << kMaxHeartbeatFailures << "): "
                   << status.error_message() << std::endl;
-        registered_.store(false);
+        if (heartbeat_consecutive_failures_ >= kMaxHeartbeatFailures) {
+          std::cerr << "[ControlPlaneWorker] Heartbeat failed "
+                    << kMaxHeartbeatFailures
+                    << " consecutive times, triggering re-registration"
+                    << std::endl;
+          registered_.store(false);
+          heartbeat_consecutive_failures_ = 0;
+        }
       } else if (response.success()) {
+        // 心跳成功，重置连续失败计数
+        heartbeat_consecutive_failures_ = 0;
         // 处理需要取消的任务
         for (const auto& task_id : response.tasks_to_cancel()) {
           std::cout << "[ControlPlaneWorker] Task cancelled by control plane: "
@@ -360,7 +391,7 @@ void ControlPlaneWorker::TaskFetchLoop() {
     }
 
     // 拉取任务
-    auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+    auto* stub = static_cast<control_plane::ControlPlaneService::Stub*>(cached_stub_.get());
 
     control_plane::FetchTaskRequest request;
     request.set_worker_id(worker_id_);
@@ -385,7 +416,7 @@ void ControlPlaneWorker::TaskFetchLoop() {
       continue;
     }
 
-    // 执行获取到的任务
+    // 问题9 修复: 并行执行获取到的任务，每个任务启动独立线程
     for (const auto& proto_task : response.tasks()) {
       if (!running_.load())
         break;
@@ -400,19 +431,14 @@ void ControlPlaneWorker::TaskFetchLoop() {
       task.shared_fs_local_prefix = proto_task.shared_fs_local_prefix();
       task.timeout_sec = proto_task.timeout_sec();
 
-      std::cout << "[ControlPlaneWorker] Executing task: " << task.task_id
-                << std::endl;
-
       // 检查任务在执行前是否已被取消
       if (IsTaskCancelled(task.task_id)) {
         std::cout << "[ControlPlaneWorker] Task already cancelled, skipping: "
                   << task.task_id << std::endl;
-        // 上报取消结果
         TaskExecutionResult cancel_result;
         cancel_result.success = false;
         cancel_result.error_message = "Task cancelled before execution";
         ReportTaskResult(task.task_id, cancel_result);
-        // 清理取消标志
         {
           std::lock_guard<std::mutex> lock(cancel_mutex_);
           cancelled_task_ids_.erase(task.task_id);
@@ -430,30 +456,55 @@ void ControlPlaneWorker::TaskFetchLoop() {
       // 标记任务开始执行
       MarkTaskRunning(task.task_id);
 
-      // 执行任务
-      auto result = ExecuteCompaction(task);
+      std::cout << "[ControlPlaneWorker] Launching task in parallel: "
+                << task.task_id << std::endl;
 
-      // 上报结果
-      ReportTaskResult(task.task_id, result);
-
-      // 减少活跃任务计数
+      // 第五轮修复 (NEW-12): 将任务线程存入 vector，Stop() 时可 join，
+      // 替代 detach() 避免 use-after-free
       {
-        std::lock_guard<std::mutex> lock(tasks_mutex_);
-        active_task_ids_.erase(
-          std::remove(active_task_ids_.begin(), active_task_ids_.end(),
-                      task.task_id),
-          active_task_ids_.end());
-      }
-      active_tasks_--;
+        std::lock_guard<std::mutex> lock(task_workers_mutex_);
+        // 先清理已完成的线程，防止 vector 无限增长
+        task_worker_threads_.erase(
+          std::remove_if(task_worker_threads_.begin(),
+                         task_worker_threads_.end(),
+                         [](std::thread& t) {
+                           // joinable 且已结束的线程无法直接检测，
+                           // 但如果线程还在运行则不能 join（会阻塞）。
+                           // 这里只清理已经不 joinable 的条目。
+                           return !t.joinable();
+                         }),
+          task_worker_threads_.end());
 
-      // 清理取消集合中的条目（如果有）
-      {
-        std::lock_guard<std::mutex> lock(cancel_mutex_);
-        cancelled_task_ids_.erase(task.task_id);
-      }
+        task_worker_threads_.emplace_back([this, task = std::move(task)]() {
+          // 执行任务
+          auto result = ExecuteCompaction(task);
 
-      std::cout << "[ControlPlaneWorker] Task completed: " << task.task_id
-                << ", success=" << result.success << std::endl;
+          // 上报结果
+          ReportTaskResult(task.task_id, result);
+
+          // 减少活跃任务计数
+          {
+            std::lock_guard<std::mutex> lock(tasks_mutex_);
+            active_task_ids_.erase(
+              std::remove(active_task_ids_.begin(), active_task_ids_.end(),
+                          task.task_id),
+              active_task_ids_.end());
+          }
+          active_tasks_--;
+
+          // 清理取消集合中的条目（如果有）
+          {
+            std::lock_guard<std::mutex> lock(cancel_mutex_);
+            cancelled_task_ids_.erase(task.task_id);
+          }
+
+          std::cout << "[ControlPlaneWorker] Task completed: " << task.task_id
+                    << ", success=" << result.success << std::endl;
+
+          // 唤醒 fetch 线程检查是否有空闲槽位
+          cv_.notify_one();
+        });
+      }
     }
 
     // 如果没有获取到任务，等待一段时间再试
@@ -529,11 +580,11 @@ void ControlPlaneWorker::MarkTaskRunning(const std::string& task_id) {
 
 void ControlPlaneWorker::ReportTaskResult(const std::string& task_id,
                                           const TaskExecutionResult& result) {
-  if (!channel_) {
+  if (!channel_ || !cached_stub_) {
     return;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto* stub = static_cast<control_plane::ControlPlaneService::Stub*>(cached_stub_.get());
 
   control_plane::TaskResultRequest request;
   request.set_worker_id(worker_id_);
@@ -624,11 +675,11 @@ BulkLoadShardResult ControlPlaneWorker::ExecuteBulkLoadShard(
 void ControlPlaneWorker::ReportBulkLoadResult(
   const std::string& task_id,
   const BulkLoadShardResult& result) {
-  if (!channel_) {
+  if (!channel_ || !cached_stub_) {
     return;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto* stub = static_cast<control_plane::ControlPlaneService::Stub*>(cached_stub_.get());
 
   // 复用 TaskResultRequest 上报，通过 SST 文件信息区分 Bulk Load 结果
   control_plane::TaskResultRequest request;

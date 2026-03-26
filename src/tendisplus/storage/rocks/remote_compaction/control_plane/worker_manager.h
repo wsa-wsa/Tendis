@@ -315,10 +315,16 @@ class WorkerManager {
 
   // CaaS-LSM: CSA gRPC 客户端连接
   std::unordered_map<std::string, std::shared_ptr<grpc::Channel>> csa_channels_;
+  // 问题12: CSA gRPC stub 缓存（避免每次调用 NewStub）
+  std::unordered_map<std::string, std::shared_ptr<void>> csa_stubs_;
   mutable std::mutex channels_mutex_;
 
   // 创建或获取 CSA 连接
   std::shared_ptr<grpc::Channel> GetOrCreateCSAChannel(const std::string& address);
+
+  // 获取或创建缓存的 CSA stub（问题12）
+  // 返回 shared_ptr 确保生命周期安全
+  std::shared_ptr<void> GetOrCreateCSAStub(const std::string& address);
 };
 
 }  // namespace control_plane

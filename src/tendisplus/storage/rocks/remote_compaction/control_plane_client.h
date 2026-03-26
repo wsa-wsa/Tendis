@@ -217,8 +217,15 @@ class ControlPlaneClient {
   bool EnsureConnected();
   std::shared_ptr<grpc::Channel> CreateChannel();
 
+  // 第五轮修复 (NEW-11): 安全获取 stub 快照。
+  // 在 mutex_ 保护下复制 shared_ptr<void> 到局部变量，
+  // 防止 Disconnect() 在 gRPC 调用期间 reset cached_stub_ 导致悬空指针。
+  std::shared_ptr<void> GetStubSnapshot();
+
   ControlPlaneClientConfig config_;
   std::shared_ptr<grpc::Channel> channel_;
+  // 缓存的 gRPC stub（opaque，在 .cc 中管理，问题12 修复）
+  std::shared_ptr<void> cached_stub_;
   std::atomic<bool> connected_{false};
   mutable std::mutex mutex_;
 };

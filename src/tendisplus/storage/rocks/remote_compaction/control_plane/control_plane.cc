@@ -67,6 +67,8 @@ class ControlPlaneServiceImpl final
     if (task) {
       response->set_found(true);
       auto* info = response->mutable_task_info();
+      // 问题5 修复: 加 per-task mutex 防止读取不一致的中间状态
+      std::lock_guard<std::mutex> task_lock(task->mtx);
       info->set_task_id(task->task_id);
       info->set_source_node_id(task->source_node_id);
       info->set_db_name(task->db_name);
@@ -109,6 +111,8 @@ class ControlPlaneServiceImpl final
     if (completed) {
       auto task = control_plane_.QueryTask(request->task_id());
       if (task) {
+        // 第五轮修复 (NEW-8): 加 per-task mutex 读取 task->status
+        std::lock_guard<std::mutex> task_lock(task->mtx);
         response->set_status(
           static_cast<::control_plane::TaskStatus>(task->status));
         response->set_compaction_result(result.compaction_result);
@@ -217,6 +221,8 @@ class ControlPlaneServiceImpl final
 
     for (const auto& task : tasks) {
       auto* proto_task = response->add_tasks();
+      // 第五轮修复 (NEW-10): 加 per-task mutex 读取 task 字段
+      std::lock_guard<std::mutex> task_lock(task->mtx);
       proto_task->set_task_id(task->task_id);
       proto_task->set_db_name(task->db_name);
       proto_task->set_store_id(task->store_id);
@@ -315,6 +321,8 @@ class ControlPlaneServiceImpl final
     
     for (const auto& task : tasks) {
       auto* proto_task = response->add_tasks();
+      // 问题5 修复: 加 per-task mutex 防止读取不一致的中间状态
+      std::lock_guard<std::mutex> task_lock(task->mtx);
       proto_task->set_task_id(task->task_id);
       proto_task->set_source_node_id(task->source_node_id);
       proto_task->set_db_name(task->db_name);
@@ -440,10 +448,12 @@ class ControlPlaneServiceImpl final
     proto_worker->set_total_failed(worker->total_failed);
     
     // 获取该 Worker 的活跃任务
+    // 第五轮修复 (NEW-9): 加 per-task mutex 读取 task 字段
     for (const auto& task_id : worker->active_task_ids) {
       auto task = control_plane_.QueryTask(task_id);
       if (task) {
         auto* proto_task = response->add_active_tasks();
+        std::lock_guard<std::mutex> task_lock(task->mtx);
         proto_task->set_task_id(task->task_id);
         proto_task->set_status(
           static_cast<::control_plane::TaskStatus>(task->status));
@@ -530,6 +540,8 @@ class ControlPlaneServiceImpl final
     }
 
     response->set_found(true);
+    // 问题5 修复: 加 per-task mutex 防止读取不一致的中间状态
+    std::lock_guard<std::mutex> task_lock(task->mtx);
     response->set_task_id(task->task_id);
     response->set_overall_status(
       static_cast<::control_plane::TaskStatus>(task->status));
@@ -1094,9 +1106,12 @@ std::vector<std::shared_ptr<TaskInfo>> ControlPlane::FetchTasks(
 
 void ControlPlane::MarkTaskRunning(const std::string& task_id) {
   auto task = scheduler_->GetTask(task_id);
-  if (task && task->status == TaskStatus::kAssigned) {
-    task->status = TaskStatus::kRunning;
-    task->start_time = std::chrono::system_clock::now();
+  if (task) {
+    std::lock_guard<std::mutex> task_lock(task->mtx);
+    if (task->status == TaskStatus::kAssigned) {
+      task->status = TaskStatus::kRunning;
+      task->start_time = std::chrono::system_clock::now();
+    }
   }
 }
 
@@ -1135,6 +1150,8 @@ class ControlPlane::BulkLoadCoordinatorImpl {
 
   // 执行分片规划（当前简化实现，后续 Commit 3.2 中完善）
   void PlanShards(std::shared_ptr<TaskInfo> task) {
+    // 问题6 修复: 修改 bulk_load_params 前加 per-task mutex
+    std::lock_guard<std::mutex> task_lock(task->mtx);
     auto& params = task->bulk_load_params;
     params.phase = BulkLoadPhase::kPlanning;
 
@@ -1164,34 +1181,78 @@ class ControlPlane::BulkLoadCoordinatorImpl {
 
   // 将分片作为子任务提交到调度器
   void SubmitShardTasks(std::shared_ptr<TaskInfo> parent_task) {
-    auto& params = parent_task->bulk_load_params;
-
-    for (auto& shard : params.shards) {
+    // 问题6 修复: 先在锁内读取所需参数，锁外提交子任务，再锁内更新 phase
+    struct ShardSubmitInfo {
       TaskInfo shard_task;
-      shard_task.type = TaskType::kBulkLoad;
-      shard_task.priority = parent_task->priority;
-      shard_task.source_node_id = parent_task->source_node_id;
-      shard_task.db_name = parent_task->db_name;
-      shard_task.store_id = params.target_store_id;
-      shard_task.max_retries = parent_task->max_retries;
+      size_t shard_index;  // 在 shards 数组中的索引
+    };
+    std::vector<ShardSubmitInfo> shard_submissions;
 
-      // 复制 Bulk Load 参数到分片任务
-      shard_task.bulk_load_params = params;
-      shard_task.bulk_load_params.shards.clear();  // 子任务不需要完整分片列表
+    {
+      std::lock_guard<std::mutex> task_lock(parent_task->mtx);
+      auto& params = parent_task->bulk_load_params;
 
-      auto shard_task_id = control_plane_.GetScheduler().SubmitBulkLoadShard(shard_task);
-      if (!shard_task_id.empty()) {
-        shard.status = TaskStatus::kPending;
-        std::cout << "[BulkLoadCoordinator] Shard " << shard.shard_id
-                  << " submitted as task " << shard_task_id << std::endl;
-      } else {
-        shard.status = TaskStatus::kFailed;
-        shard.error_message = "Failed to submit shard task";
-        params.failed_shards++;
+      for (size_t i = 0; i < params.shards.size(); i++) {
+        ShardSubmitInfo info;
+        info.shard_index = i;
+
+        info.shard_task.type = TaskType::kBulkLoad;
+        info.shard_task.priority = parent_task->priority;
+        info.shard_task.source_node_id = parent_task->source_node_id;
+        info.shard_task.db_name = parent_task->db_name;
+        info.shard_task.store_id = params.target_store_id;
+        info.shard_task.max_retries = parent_task->max_retries;
+        info.shard_task.parent_task_id = parent_task->task_id;
+
+        // 复制 Bulk Load 参数到分片任务
+        info.shard_task.bulk_load_params = params;
+        info.shard_task.bulk_load_params.shards.clear();
+
+        shard_submissions.push_back(std::move(info));
+      }
+    }
+    // ---- per-task mutex 已释放 ----
+
+    // 在锁外提交子任务（SubmitBulkLoadShard 内部会获取其他锁）
+    struct ShardResult {
+      size_t shard_index;
+      std::string shard_task_id;
+      bool success;
+    };
+    std::vector<ShardResult> results;
+
+    for (auto& sub : shard_submissions) {
+      auto shard_task_id = control_plane_.GetScheduler().SubmitBulkLoadShard(
+        sub.shard_task);
+      ShardResult r;
+      r.shard_index = sub.shard_index;
+      r.shard_task_id = shard_task_id;
+      r.success = !shard_task_id.empty();
+      results.push_back(r);
+
+      if (r.success) {
+        std::cout << "[BulkLoadCoordinator] Shard submitted as task "
+                  << shard_task_id << std::endl;
       }
     }
 
-    params.phase = BulkLoadPhase::kSSTGenerating;
+    // 锁内更新分片状态和 phase
+    {
+      std::lock_guard<std::mutex> task_lock(parent_task->mtx);
+      auto& params = parent_task->bulk_load_params;
+      for (const auto& r : results) {
+        if (r.shard_index < params.shards.size()) {
+          if (r.success) {
+            params.shards[r.shard_index].status = TaskStatus::kPending;
+          } else {
+            params.shards[r.shard_index].status = TaskStatus::kFailed;
+            params.shards[r.shard_index].error_message = "Failed to submit shard task";
+            params.failed_shards++;
+          }
+        }
+      }
+      params.phase = BulkLoadPhase::kSSTGenerating;
+    }
   }
 
   // 处理 SST 注入结果
@@ -1207,6 +1268,8 @@ class ControlPlane::BulkLoadCoordinatorImpl {
                 << task_id << std::endl;
       return;
     }
+
+    std::lock_guard<std::mutex> task_lock(task->mtx);
 
     if (success) {
       task->bulk_load_params.phase = BulkLoadPhase::kCompleted;
@@ -1280,20 +1343,55 @@ bool ControlPlane::CancelBulkLoad(const std::string& task_id,
     return false;
   }
 
-  // 取消所有分片
+  // 收集需要通知取消的 running 分片及其 worker_id
+  struct ShardCancelInfo {
+    std::string shard_id;
+    std::string worker_id;
+  };
+  std::vector<ShardCancelInfo> shards_to_cancel_on_workers;
+
+  // 取消所有分片 — 在 per-task mutex 保护下修改
   uint32_t cancelled = 0;
-  for (auto& shard : task->bulk_load_params.shards) {
-    if (shard.status == TaskStatus::kPending ||
-        shard.status == TaskStatus::kRunning) {
-      shard.status = TaskStatus::kCancelled;
-      cancelled++;
+  {
+    std::lock_guard<std::mutex> task_lock(task->mtx);
+
+    // 检查任务是否已在终态
+    if (task->IsTerminal()) {
+      // 幂等性：已取消的任务再次取消返回 true
+      if (task->status == TaskStatus::kCancelled) {
+        return true;
+      }
+      return false;
     }
+
+    for (auto& shard : task->bulk_load_params.shards) {
+      if (shard.status == TaskStatus::kPending ||
+          shard.status == TaskStatus::kRunning) {
+        // 问题13: 记录 running 分片的 worker 信息，稍后通知 Worker 取消
+        if (shard.status == TaskStatus::kRunning &&
+            !shard.assigned_worker_id.empty()) {
+          shards_to_cancel_on_workers.push_back(
+            {shard.shard_id, shard.assigned_worker_id});
+        }
+        shard.status = TaskStatus::kCancelled;
+        cancelled++;
+      }
+    }
+
+    task->bulk_load_params.phase = BulkLoadPhase::kCancelled;
+    task->status = TaskStatus::kCancelled;
+    task->error_message = reason;
+    task->complete_time = std::chrono::system_clock::now();
   }
 
-  task->bulk_load_params.phase = BulkLoadPhase::kCancelled;
-  task->status = TaskStatus::kCancelled;
-  task->error_message = reason;
-  task->complete_time = std::chrono::system_clock::now();
+  // 问题13: 通知 CSA Worker 取消正在执行的分片任务
+  if (worker_manager_ && !shards_to_cancel_on_workers.empty()) {
+    for (const auto& info : shards_to_cancel_on_workers) {
+      worker_manager_->CancelCSATask(info.worker_id, info.shard_id);
+      std::cout << "[ControlPlane] Notified worker " << info.worker_id
+                << " to cancel shard: " << info.shard_id << std::endl;
+    }
+  }
 
   std::cout << "[ControlPlane] Bulk Load cancelled: " << task_id
             << " (" << cancelled << " shards cancelled)" << std::endl;

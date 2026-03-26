@@ -11,6 +11,7 @@
 #include <chrono>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -298,6 +299,10 @@ struct CompactionTaskParams {
 // 任务信息
 // ============================================================================
 struct TaskInfo {
+  // Per-task mutex: 保护此 TaskInfo 的并发访问
+  // (mutable 允许在 const 方法中加锁)
+  mutable std::mutex mtx;
+
   // 基本信息
   std::string task_id;
   TaskType type = TaskType::kCompaction;
@@ -336,6 +341,77 @@ struct TaskInfo {
   // CaaS-LSM: 是否应该降级到本地执行
   bool should_fallback = false;
 
+  // Bulk Load 父任务 ID (分片子任务用来关联父任务)
+  std::string parent_task_id;
+
+  // 默认构造函数
+  TaskInfo() = default;
+
+  // 自定义拷贝构造函数: 拷贝所有字段但跳过 mutex（新对象获得新锁）
+  // 问题3 修复: 加锁 other.mtx 防止并发修改导致 torn read UB
+  TaskInfo(const TaskInfo& other) {
+    std::lock_guard<std::mutex> lock(other.mtx);
+    task_id = other.task_id;
+    type = other.type;
+    status = other.status;
+    priority = other.priority;
+    source_node_id = other.source_node_id;
+    db_name = other.db_name;
+    store_id = other.store_id;
+    assigned_worker_id = other.assigned_worker_id;
+    retry_count = other.retry_count;
+    max_retries = other.max_retries;
+    reschedule_count = other.reschedule_count;
+    submit_time = other.submit_time;
+    assign_time = other.assign_time;
+    start_time = other.start_time;
+    complete_time = other.complete_time;
+    params = other.params;
+    bulk_load_params = other.bulk_load_params;
+    result = other.result;
+    error_message = other.error_message;
+    should_fallback = other.should_fallback;
+    parent_task_id = other.parent_task_id;
+  }
+
+  // 自定义拷贝赋值运算符
+  // 问题3 修复: 同时加锁 this->mtx 和 other.mtx，使用地址顺序避免死锁
+  TaskInfo& operator=(const TaskInfo& other) {
+    if (this != &other) {
+      // 按地址顺序加锁，防止两个 TaskInfo 互相赋值时死锁
+      std::mutex* first = &mtx;
+      std::mutex* second = &other.mtx;
+      if (first > second) {
+        std::swap(first, second);
+      }
+      std::lock_guard<std::mutex> lock1(*first);
+      std::lock_guard<std::mutex> lock2(*second);
+
+      task_id = other.task_id;
+      type = other.type;
+      status = other.status;
+      priority = other.priority;
+      source_node_id = other.source_node_id;
+      db_name = other.db_name;
+      store_id = other.store_id;
+      assigned_worker_id = other.assigned_worker_id;
+      retry_count = other.retry_count;
+      max_retries = other.max_retries;
+      reschedule_count = other.reschedule_count;
+      submit_time = other.submit_time;
+      assign_time = other.assign_time;
+      start_time = other.start_time;
+      complete_time = other.complete_time;
+      params = other.params;
+      bulk_load_params = other.bulk_load_params;
+      result = other.result;
+      error_message = other.error_message;
+      should_fallback = other.should_fallback;
+      parent_task_id = other.parent_task_id;
+    }
+    return *this;
+  }
+
   // 辅助方法
   bool IsTerminal() const {
     return status == TaskStatus::kCompleted || status == TaskStatus::kFailed ||
@@ -350,6 +426,27 @@ struct TaskInfo {
 
   bool IsRetrying() const {
     return status == TaskStatus::kRetrying;
+  }
+
+  // 原子化状态转换 (CAS pattern): 仅当当前状态为 expected 时才转换为 new_status
+  // 返回 true 表示转换成功，false 表示状态已被其他线程修改
+  // 调用者必须先持有 mtx 锁
+  bool TryTransition(TaskStatus expected, TaskStatus new_status) {
+    if (status == expected) {
+      status = new_status;
+      return true;
+    }
+    return false;
+  }
+
+  // 原子化状态转换: 当前状态为 expected1 或 expected2 时转换
+  bool TryTransitionFrom(TaskStatus expected1, TaskStatus expected2,
+                         TaskStatus new_status) {
+    if (status == expected1 || status == expected2) {
+      status = new_status;
+      return true;
+    }
+    return false;
   }
 
   int64_t GetQueueTimeMs() const {

@@ -57,6 +57,8 @@ bool ControlPlaneClient::Connect() {
                   std::chrono::milliseconds(config_.connect_timeout_ms);
 
   if (channel_->WaitForConnected(deadline)) {
+    // 问题12: 连接成功后创建缓存的 stub
+    cached_stub_ = control_plane::ControlPlaneService::NewStub(channel_);
     connected_.store(true);
     std::cout << "[ControlPlaneClient] Connected to control plane: "
               << config_.control_plane_address << std::endl;
@@ -75,21 +77,42 @@ bool ControlPlaneClient::IsConnected() const {
 void ControlPlaneClient::Disconnect() {
   std::lock_guard<std::mutex> lock(mutex_);
   connected_.store(false);
+  cached_stub_.reset();
   channel_.reset();
 }
 
 bool ControlPlaneClient::EnsureConnected() {
+  // 问题8 修复: 使用 mutex_ 保护整个连接检查和重连逻辑
+  // 快速路径: 先用 atomic 检查，避免大多数情况下获取锁
   if (connected_.load()) {
-    // 检查连接是否仍然有效
-    if (channel_) {
+    // 需要持有 mutex_ 来安全访问 channel_
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (connected_.load() && channel_) {
       auto state = channel_->GetState(false);
       if (state == GRPC_CHANNEL_READY || state == GRPC_CHANNEL_IDLE) {
         return true;
       }
+      // 连接已断开，重置状态
+      connected_.store(false);
+      cached_stub_.reset();
     }
-    connected_.store(false);
   }
+  // Connect() 内部会获取 mutex_，这里不能持有
   return Connect();
+}
+
+// 获取缓存的 stub（问题12: 避免每次调用 NewStub）
+static control_plane::ControlPlaneService::Stub* GetCachedStub(
+    const std::shared_ptr<void>& cached_stub) {
+  return static_cast<control_plane::ControlPlaneService::Stub*>(
+      cached_stub.get());
+}
+
+// 第五轮修复 (NEW-11): 在 mutex_ 保护下复制 shared_ptr，
+// 确保 gRPC 调用期间 stub 不会被 Disconnect() 重置
+std::shared_ptr<void> ControlPlaneClient::GetStubSnapshot() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return cached_stub_;
 }
 
 std::shared_ptr<grpc::Channel> ControlPlaneClient::CreateChannel() {
@@ -119,7 +142,14 @@ SubmitResult ControlPlaneClient::SubmitCompactionTask(
     return result;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  // 第五轮修复 (NEW-11): 复制 stub shared_ptr 到局部变量，
+  // 防止 Disconnect() 在 gRPC 调用期间 reset 导致悬空指针
+  auto stub_snapshot = GetStubSnapshot();
+  if (!stub_snapshot) {
+    result.error_message = "Stub not available";
+    return result;
+  }
+  auto* stub = GetCachedStub(stub_snapshot);
 
   control_plane::SubmitTaskRequest request;
   request.set_source_node_id(source_node_id);
@@ -165,7 +195,11 @@ RemoteTaskStatus ControlPlaneClient::QueryTaskStatus(
     return RemoteTaskStatus::kUnknown;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto stub_snapshot = GetStubSnapshot();
+  if (!stub_snapshot) {
+    return RemoteTaskStatus::kUnknown;
+  }
+  auto* stub = GetCachedStub(stub_snapshot);
 
   control_plane::QueryTaskRequest request;
   request.set_task_id(task_id);
@@ -192,7 +226,11 @@ bool ControlPlaneClient::CancelTask(const std::string& task_id,
     return false;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto stub_snapshot = GetStubSnapshot();
+  if (!stub_snapshot) {
+    return false;
+  }
+  auto* stub = GetCachedStub(stub_snapshot);
 
   control_plane::CancelTaskRequest request;
   request.set_task_id(task_id);
@@ -219,7 +257,12 @@ TaskResultInfo ControlPlaneClient::WaitForTaskResult(const std::string& task_id,
     return result;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto stub_snapshot = GetStubSnapshot();
+  if (!stub_snapshot) {
+    result.error_message = "Stub not available";
+    return result;
+  }
+  auto* stub = GetCachedStub(stub_snapshot);
 
   control_plane::WaitResultRequest request;
   request.set_task_id(task_id);
@@ -265,7 +308,12 @@ SubmitResult ControlPlaneClient::SubmitBulkLoadTask(
     return result;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto stub_snapshot = GetStubSnapshot();
+  if (!stub_snapshot) {
+    result.error_message = "Stub not available";
+    return result;
+  }
+  auto* stub = GetCachedStub(stub_snapshot);
 
   control_plane::SubmitBulkLoadRequest request;
   request.set_source_node_id(source_node_id);
@@ -330,7 +378,12 @@ BulkLoadStatusInfo ControlPlaneClient::QueryBulkLoadStatus(
     return info;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto stub_snapshot = GetStubSnapshot();
+  if (!stub_snapshot) {
+    info.error_message = "Stub not available";
+    return info;
+  }
+  auto* stub = GetCachedStub(stub_snapshot);
 
   control_plane::QueryBulkLoadRequest request;
   request.set_task_id(task_id);
@@ -396,7 +449,11 @@ bool ControlPlaneClient::ReportIngestResult(
     return false;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto stub_snapshot = GetStubSnapshot();
+  if (!stub_snapshot) {
+    return false;
+  }
+  auto* stub = GetCachedStub(stub_snapshot);
 
   control_plane::ReportIngestResultRequest request;
   request.set_task_id(task_id);
@@ -435,7 +492,11 @@ bool ControlPlaneClient::CancelBulkLoad(const std::string& task_id,
     return false;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto stub_snapshot = GetStubSnapshot();
+  if (!stub_snapshot) {
+    return false;
+  }
+  auto* stub = GetCachedStub(stub_snapshot);
 
   control_plane::CancelBulkLoadRequest request;
   request.set_task_id(task_id);
@@ -473,7 +534,11 @@ ControlPlaneClient::ClusterStatus ControlPlaneClient::GetClusterStatus() {
     return status;
   }
 
-  auto stub = control_plane::ControlPlaneService::NewStub(channel_);
+  auto stub_snapshot = GetStubSnapshot();
+  if (!stub_snapshot) {
+    return status;
+  }
+  auto* stub = GetCachedStub(stub_snapshot);
 
   control_plane::ClusterStatusRequest request;
   control_plane::ClusterStatusResponse response;

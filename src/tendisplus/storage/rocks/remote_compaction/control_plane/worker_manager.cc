@@ -457,6 +457,34 @@ std::shared_ptr<grpc::Channel> WorkerManager::GetOrCreateCSAChannel(
   return channel;
 }
 
+// 问题12: 获取或创建缓存的 CSA gRPC stub
+std::shared_ptr<void> WorkerManager::GetOrCreateCSAStub(const std::string& address) {
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  
+  auto it = csa_stubs_.find(address);
+  if (it != csa_stubs_.end()) {
+    return it->second;
+  }
+  
+  // 先确保 channel 存在
+  auto ch_it = csa_channels_.find(address);
+  if (ch_it == csa_channels_.end()) {
+    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    csa_channels_[address] = channel;
+    std::shared_ptr<void> stub_ptr(::control_plane::CSAService::NewStub(channel).release(),
+      [](void* p) { delete static_cast<::control_plane::CSAService::Stub*>(p); });
+    csa_stubs_[address] = stub_ptr;
+    std::cout << "[WorkerManager] Created gRPC channel+stub to CSA: " << address
+              << std::endl;
+    return stub_ptr;
+  }
+  
+  std::shared_ptr<void> stub_ptr(::control_plane::CSAService::NewStub(ch_it->second).release(),
+    [](void* p) { delete static_cast<::control_plane::CSAService::Stub*>(p); });
+  csa_stubs_[address] = stub_ptr;
+  return stub_ptr;
+}
+
 bool WorkerManager::CheckCSAStatus(const std::string& worker_id) {
   auto worker = GetWorker(worker_id);
   if (!worker) {
@@ -477,9 +505,10 @@ bool WorkerManager::CheckCSAStatus(const std::string& worker_id) {
   }
   
   // 通过 gRPC 调用 CSAService::CheckCSAStatus 获取详细状态
-  auto stub = ::control_plane::CSAService::NewStub(channel);
+  auto stub_ptr = GetOrCreateCSAStub(worker->address);
+  auto* stub = static_cast<::control_plane::CSAService::Stub*>(stub_ptr.get());
   if (!stub) {
-    std::cerr << "[WorkerManager] Failed to create CSAService stub for: "
+    std::cerr << "[WorkerManager] Failed to get CSAService stub for: "
               << worker->address << std::endl;
     return false;
   }
@@ -541,17 +570,11 @@ bool WorkerManager::DistributeJobToCSA(const std::string& worker_id,
     return false;
   }
   
-  auto channel = GetOrCreateCSAChannel(worker->address);
-  if (!channel) {
-    std::cerr << "[WorkerManager] Failed to create channel to CSA: "
-              << worker->address << std::endl;
-    return false;
-  }
-  
-  // 创建 CSAService::Stub 并调用 DistributeCompactionJob RPC
-  auto stub = ::control_plane::CSAService::NewStub(channel);
+  // 使用缓存的 CSAService::Stub（问题12，内部自动管理 channel）
+  auto stub_ptr = GetOrCreateCSAStub(worker->address);
+  auto* stub = static_cast<::control_plane::CSAService::Stub*>(stub_ptr.get());
   if (!stub) {
-    std::cerr << "[WorkerManager] Failed to create CSAService stub for: "
+    std::cerr << "[WorkerManager] Failed to get CSAService stub for: "
               << worker->address << std::endl;
     return false;
   }
@@ -630,17 +653,11 @@ bool WorkerManager::DistributeBulkLoadShardToCSA(
     return false;
   }
 
-  auto channel = GetOrCreateCSAChannel(worker->address);
-  if (!channel) {
-    std::cerr << "[WorkerManager] BulkLoad: Failed to create channel to CSA: "
-              << worker->address << std::endl;
-    return false;
-  }
-
-  // 创建 CSAService::Stub 并调用 ExecuteBulkLoadShard RPC
-  auto stub = ::control_plane::CSAService::NewStub(channel);
+  // 使用缓存的 CSAService::Stub（问题12，内部自动管理 channel）
+  auto stub_ptr = GetOrCreateCSAStub(worker->address);
+  auto* stub = static_cast<::control_plane::CSAService::Stub*>(stub_ptr.get());
   if (!stub) {
-    std::cerr << "[WorkerManager] BulkLoad: Failed to create stub for: "
+    std::cerr << "[WorkerManager] BulkLoad: Failed to get stub for: "
               << worker->address << std::endl;
     return false;
   }
@@ -723,17 +740,11 @@ bool WorkerManager::CancelCSATask(const std::string& worker_id,
     return false;
   }
   
-  auto channel = GetOrCreateCSAChannel(worker->address);
-  if (!channel) {
-    std::cerr << "[WorkerManager] CancelCSATask: failed to create channel to: "
-              << worker->address << std::endl;
-    return false;
-  }
-  
-  // 创建 CSAService::Stub 并调用 CancelRunningTask RPC
-  auto stub = ::control_plane::CSAService::NewStub(channel);
+  // 使用缓存的 CSAService::Stub（问题12，内部自动管理 channel）
+  auto stub_ptr = GetOrCreateCSAStub(worker->address);
+  auto* stub = static_cast<::control_plane::CSAService::Stub*>(stub_ptr.get());
   if (!stub) {
-    std::cerr << "[WorkerManager] CancelCSATask: failed to create stub for: "
+    std::cerr << "[WorkerManager] CancelCSATask: failed to get stub for: "
               << worker->address << std::endl;
     return false;
   }
