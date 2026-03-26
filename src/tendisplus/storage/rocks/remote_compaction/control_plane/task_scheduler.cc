@@ -219,6 +219,9 @@ bool TaskScheduler::CancelTask(const std::string& task_id,
     return false;  // 已经结束的任务不能取消
   }
 
+  // 保存旧状态（用于正确更新统计计数器）
+  TaskStatus old_status = task->status;
+
   // 更新状态
   task->status = TaskStatus::kCancelled;
   task->error_message = reason;
@@ -235,11 +238,12 @@ bool TaskScheduler::CancelTask(const std::string& task_id,
     }
   }
 
-  // 更新统计
+  // 更新统计（根据旧状态决定减少哪个计数器）
   statistics_.total_cancelled++;
-  if (task->status == TaskStatus::kPending) {
+  if (old_status == TaskStatus::kPending) {
     statistics_.pending_count--;
-  } else {
+  } else if (old_status == TaskStatus::kRunning ||
+             old_status == TaskStatus::kAssigned) {
     statistics_.running_count--;
   }
 
@@ -566,54 +570,55 @@ std::vector<SchedulingDecision> TaskScheduler::DoSchedule() {
     available_workers.end());
 
   // 从队列中取出任务进行调度
-  std::lock_guard<std::mutex> lock(pending_mutex_);
-
   // CaaS-LSM: 处理需要降级的任务
   std::vector<std::shared_ptr<TaskInfo>> fallback_tasks;
 
-  while (!pending_queue_.empty()) {
-    auto task = pending_queue_.top();
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
 
-    // CaaS-LSM: 检查是否应该降级（传入 pending_size 避免死锁）
-    if (ShouldFallback(task, pending_queue_.size())) {
+    while (!pending_queue_.empty()) {
+      auto task = pending_queue_.top();
+
+      // CaaS-LSM: 检查是否应该降级（传入 pending_size 避免死锁）
+      if (ShouldFallback(task, pending_queue_.size())) {
+        pending_queue_.pop();
+        fallback_tasks.push_back(task);
+        continue;
+      }
+
+      // 如果没有可用 Worker，停止调度
+      if (available_workers.empty()) {
+        break;
+      }
+
+      // 选择 Worker
+      auto worker = SelectWorker(*task);
+      if (!worker) {
+        break;  // 没有可用 Worker
+      }
+
       pending_queue_.pop();
-      fallback_tasks.push_back(task);
-      continue;
+
+      SchedulingDecision decision;
+      decision.task_id = task->task_id;
+      decision.worker_id = worker->worker_id;
+      decision.should_schedule = true;
+
+      decisions.push_back(decision);
+
+      // 更新可用 Worker 列表
+      available_workers.erase(
+        std::remove_if(available_workers.begin(),
+                       available_workers.end(),
+                       [&worker](const std::shared_ptr<WorkerInfo>& w) {
+                         return w->worker_id == worker->worker_id &&
+                                w->resources.AvailableSlots() <= 1;
+                       }),
+        available_workers.end());
     }
+  }  // pending_mutex_ 在此释放
 
-    // 如果没有可用 Worker，停止调度
-    if (available_workers.empty()) {
-      break;
-    }
-
-    // 选择 Worker
-    auto worker = SelectWorker(*task);
-    if (!worker) {
-      break;  // 没有可用 Worker
-    }
-
-    pending_queue_.pop();
-
-    SchedulingDecision decision;
-    decision.task_id = task->task_id;
-    decision.worker_id = worker->worker_id;
-    decision.should_schedule = true;
-
-    decisions.push_back(decision);
-
-    // 更新可用 Worker 列表
-    available_workers.erase(
-      std::remove_if(available_workers.begin(),
-                     available_workers.end(),
-                     [&worker](const std::shared_ptr<WorkerInfo>& w) {
-                       return w->worker_id == worker->worker_id &&
-                              w->resources.AvailableSlots() <= 1;
-                     }),
-      available_workers.end());
-  }
-
-  // 在锁外处理降级任务
-  // 注意：这里需要释放锁后处理
+  // 在锁外处理降级任务（避免长时间持有 pending_mutex_）
   for (auto& task : fallback_tasks) {
     HandleFallback(task, "Fallback condition met");
   }

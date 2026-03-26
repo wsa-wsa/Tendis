@@ -612,13 +612,6 @@ class CSAServiceImpl final : public ::control_plane::CSAService::Service {
     response->set_local_task_nums(local_task_nums_.load());
     response->set_is_healthy(true);
 
-    // 检查是否超过最大并发任务数来判断健康状态
-    int64_t max_tasks = GetMaxConcurrentTasks();
-    if (local_task_nums_.load() >= max_tasks) {
-      // 服务器忙碌但仍然健康
-      response->set_is_healthy(true);
-    }
-
     return grpc::Status::OK;
   }
 
